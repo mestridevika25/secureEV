@@ -1,0 +1,57 @@
+# ============================================================
+# SecureEV
+# Attack Resistant Cybersecurity Measures for Next-Gen Connected EVs
+# Current Development Environment: CARLA 0.9.15 + Python 3.10
+# ============================================================
+
+# ------------------------------------------------------------
+# PHASE 1-3: CARLA + Simulation + Manual Driving
+# ------------------------------------------------------------
+carla==0.9.15
+pygame>=2.5.0,<2.7.0
+
+
+# ------------------------------------------------------------
+# PHASE 4: Virtual Vehicle Network / MQTT
+# Install when MQTT development begins
+# ------------------------------------------------------------
+paho-mqtt>=2.1.0
+
+
+# ------------------------------------------------------------
+# PHASE 5-6: Backend + Real-Time Dashboard
+# Install when FastAPI development begins
+# ------------------------------------------------------------
+# fastapi>=0.115.0
+# uvicorn[standard]>=0.30.0
+# websockets>=13.0
+
+
+# ------------------------------------------------------------
+# PHASE 7: Database
+# Install when database integration begins
+# ------------------------------------------------------------
+# sqlalchemy>=2.0.0
+# psycopg2-binary>=2.9.0
+
+
+# ------------------------------------------------------------
+# PHASE 8: Authentication
+# Install when JWT authentication begins
+# ------------------------------------------------------------
+# python-jose[cryptography]>=3.3.0
+# passlib[bcrypt]>=1.7.4
+
+
+# ------------------------------------------------------------
+# PHASE 9: Cybersecurity / Detection / Analytics
+# Install only when required
+# ------------------------------------------------------------
+# numpy>=1.26.0,<2.1.0
+# scikit-learn>=1.5.0,<1.8.0
+
+
+# ------------------------------------------------------------
+# DEVELOPMENT / TESTING
+# ------------------------------------------------------------
+# pytest>=8.0.0

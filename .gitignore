@@ -1,0 +1,25 @@
+# Local Python environments
+venv/
+.venv/
+venv_*/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime output
+logs/*
+reports/*
+!.gitkeep
+
+# Local environment and editor files
+.env
+.vscode/
