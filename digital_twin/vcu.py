@@ -99,7 +99,21 @@ class VCU(BaseECU):
         )
 
     def emergency_brake(self) -> None:
-        """Apply full braking through the trusted CARLA interface."""
+        """Immediately stop the EV through the trusted CARLA bridge.
+
+        The bridge first disables Traffic Manager autopilot so the autonomous
+        controller cannot overwrite the safety brake on the next simulator
+        update.
+        """
+
+        self.throttle = 0.0
+        self.brake = 1.0
+        self.steer = 0.0
+
+        emergency_stop = getattr(self.carla_bridge, "emergency_stop", None)
+        if callable(emergency_stop):
+            emergency_stop()
+            return
 
         self.apply_command(
             throttle=0.0,

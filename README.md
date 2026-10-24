@@ -63,7 +63,7 @@ Technology Stack
 
 Simulation
 
-CARLA 0.9.15
+CARLA 0.9.16
 
 Unreal Engine based vehicle simulation
 
@@ -193,7 +193,7 @@ Environment Setup
 
 1. CARLA
 
-The current development target is CARLA 0.9.15.
+The current development target is CARLA 0.9.16.
 
 For the stable local configuration used during development:
 
@@ -995,14 +995,71 @@ Phase 6B   ✅ Telemetry Spoofing
 Phase 7    ✅ Ground Truth Validation
 Phase 8A   ✅ Response Policy
 Phase 8B   ✅ Runtime Response
-Phase 9    🔄 Recovery
-Phase 10   ⏳ Security Evaluation
-Phase 11   ⏳ FastAPI Backend
-Phase 12   ⏳ Database
-Phase 13   ⏳ React Dashboard
-Phase 14   ⏳ Final Security Evaluation
-Phase 15   ⏳ Final Demo
+Phase 9    ✅ Recovery API / safe-state reset
+Phase 10   🔄 Security Evaluation (operational counts; benchmark timing pending)
+Phase 11   ✅ FastAPI Backend
+Phase 12   ✅ SQLite Database + SQLAlchemy Models
+Phase 13   ✅ React Dashboard + WebSocket + live CARLA camera
+Phase 14   ⏳ Final Security Evaluation / benchmark scenarios
+Phase 15   ⏳ Final Demo / packaging
 
 License / Academic Use
 
 This project is developed as an academic cybersecurity and connected-EV simulation project. Attack functionality is intended only for the isolated SecureEV test environment.
+
+Person 2 — Application Layer
+
+The Person 2 application layer is integrated with the existing SecureEV core:
+
+CARLA + Digital Twin
+  ↓
+MQTT vehicle network
+  ↓
+FastAPI REST + WebSocket
+  ↓
+SQLite / SQLAlchemy history
+  ↓
+React dashboard
+
+Implemented application features:
+
+- Live vehicle telemetry and ECU health
+- Protected VCU control commands through the existing MQTT/security gateway path
+- Security alerts, attacks, responses and recovery history
+- Current-session risk state
+- Recovery endpoint that resets the simulated vehicle to a safe baseline
+- Live CARLA RGB camera feed through a browser-compatible MJPEG endpoint
+- JSON and CSV report export
+- Dashboard attack console for the existing controlled attack scenarios
+- Smooth third-person CARLA spectator following the SecureEV vehicle
+
+Local startup
+
+The repository includes `scripts/start_secureev.ps1` and `scripts/stop_secureev.ps1`. The start script expects the project Python environment at `.venv` and the CARLA installation at `C:\SecureEV\CARLA` by default. Set `SECUREEV_CARLA_HOME` to override the CARLA directory.
+
+Manual startup is also supported:
+
+1. Start Mosquitto on localhost:1883.
+2. Start CARLA 0.9.16 with RPC port 2000.
+3. Activate `.venv` and run `python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000`.
+4. In `frontend`, run `npm install` and `npm run dev`.
+5. Open `http://127.0.0.1:5173`.
+
+Scope note
+
+The application layer does not claim production-grade authentication, cryptographic OTA, automotive certification, or a validated machine-learning IDS benchmark. Timing and false-positive metrics are deliberately left unset until a labeled evaluation dataset/scenario suite is executed.
+
+## Person 2 Application Layer Startup
+
+The completed application layer provides FastAPI REST endpoints, a live WebSocket endpoint, SQLite/SQLAlchemy persistence, CARLA camera streaming, and a React/Vite dashboard.
+
+On Windows, create the project-local Python 3.10 environment and install requirements once. Then use `scripts\\start_all.bat` for normal startup. If CARLA was not already running, the launcher starts it directly from the configured `C:\\SecureEV\\CARLA` installation and verifies the actual CARLA Python RPC API before starting FastAPI.
+
+## Current Windows Startup
+
+Use `scripts\\start_all.bat` after first-time Python/frontend setup. The launcher starts CARLA directly, verifies its real Python RPC API, then starts the SecureEV application layer and dashboard. See `START_HERE.txt` for the manual CARLA fallback.
+
+
+## Autonomous patrol mode
+
+The live application starts the SecureEV vehicle in an autonomous city-patrol mode by default. CARLA Traffic Manager controls the Tesla on the road network and provides dynamic urban path selection, traffic-aware following and lane behaviour. FastAPI exposes explicit autonomous/manual mode controls. During autonomous operation, confirmed HIGH/CRITICAL telemetry integrity findings cause a safe stop; the recovery endpoint restores the vehicle and resumes patrol.
