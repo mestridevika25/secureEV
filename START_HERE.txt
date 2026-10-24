@@ -1,0 +1,85 @@
+SECUREEV - START HERE
+====================
+
+Windows development setup
+
+REQUIRED
+- Python 3.10.x
+- CARLA 0.9.16
+- Mosquitto on localhost:1883
+- Node.js + npm
+
+PROJECT FOLDER
+C:\Users\shrey\Downloads\SecureEV_completed_v6\secureEV
+
+CARLA INSTALLATION
+C:\SecureEV\CARLA\CarlaUE4.exe
+
+ONE-TIME SETUP
+1. py -3.10 -m venv .venv
+2. .\.venv\Scripts\Activate.ps1
+3. python -m pip install -r requirements.txt
+4. cd frontend
+5. npm install
+6. cd ..
+7. powershell -ExecutionPolicy Bypass -File .\scripts\verify_secureev.ps1
+
+NORMAL STARTUP
+1. Start CARLA manually (recommended for this Windows GPU setup):
+
+    cd /d C:\SecureEV\CARLA
+    .\CarlaUE4.exe -quality-level=Low -nosound -windowed -ResX=1024 -ResY=576 -dx11 -carla-rpc-port=2000
+
+2. From the SecureEV project root verify CARLA:
+
+    python .\scripts\check_carla.py
+
+3. Start the application layer:
+
+    .\scripts\start_all.bat
+
+The application launcher does NOT launch CARLA. This avoids duplicate/stale CARLA processes and lets you verify the simulator before starting the SecureEV runtime.
+
+DASHBOARD
+http://127.0.0.1:5173
+
+API DOCS
+http://127.0.0.1:8000/docs
+
+MANUAL CARLA FALLBACK
+If the launcher cannot make CARLA RPC ready, close all CARLA processes and run this manually:
+
+    cd /d C:\SecureEV\CARLA
+    .\CarlaUE4.exe -quality-level=Low -nosound -windowed -ResX=1024 -ResY=576 -dx11 -carla-rpc-port=2000
+
+Wait until the CARLA window is fully loaded. Then from the SecureEV project root:
+
+    .\.venv\Scripts\Activate.ps1
+    python .\scripts\check_carla.py
+
+Expected:
+    CARLA_SERVER_VERSION: 0.9.16
+    CARLA_MAP: ...
+
+After that succeeds:
+
+    .\scripts\start_all.bat
+
+AUTONOMOUS PATROL
+- SecureEV starts in AUTONOMOUS_PATROL mode by default.
+- CARLA Traffic Manager drives the EV on the road network, respects traffic signals, maintains following distance, and can choose different branches at junctions.
+- Use the dashboard to switch between AUTONOMOUS_PATROL and MANUAL MODE or request a fresh route seed.
+- A confirmed HIGH/CRITICAL telemetry integrity anomaly during autonomous driving forces a fail-safe stop.
+- Recovery resets the EV and resumes autonomous patrol.
+- Traffic Manager uses port 8001 so it does not conflict with FastAPI on port 8000.
+
+CAMERA STABILITY
+- The RGB camera is disabled by default. This is intentional for GPU stability.
+- Enable it from the dashboard only if CARLA remains stable.
+- If CARLA shows a D3D device error, leave the camera disabled and use the CARLA spectator window for the 3D view.
+
+IMPORTANT
+- Do not start a second CARLA instance.
+- Do not start two FastAPI servers on port 8000.
+- Do not delete .venv.
+- CARLA is external to the project repository.
