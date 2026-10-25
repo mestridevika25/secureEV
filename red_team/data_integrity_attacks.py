@@ -1,12 +1,19 @@
-"""
-data_integrity_attacks.py — Class 4: Data-at-rest integrity attacks (Phase 8)
+"""Controlled maintenance-record tampering scenario for local testing."""
 
-    maintenance_log_manipulation -> silently edits/deletes a stored service
-                                     record (e.g. hiding a known safety fault)
+from __future__ import annotations
 
-This attack never touches live telemetry or CARLA at all — it targets the
-database directly. Detected via hash-chain verification
-(blue_team/integrity_checker.py), not real-time monitoring.
+from typing import Any, MutableMapping
 
-NOT YET IMPLEMENTED.
-"""
+
+def maintenance_log_manipulation(entry: MutableMapping[str, Any]) -> dict[str, Any]:
+    """Alter one record's content while deliberately retaining its old hash."""
+    if not isinstance(entry, MutableMapping) or not isinstance(entry.get("data"), dict):
+        raise TypeError("entry must be a maintenance-log record with object data.")
+    original_hash = entry.get("record_hash")
+    entry["data"] = {**entry["data"], "inspection": "tampered"}
+    return {
+        "name": "maintenance_log_manipulation",
+        "entry_id": entry.get("entry_id"),
+        "original_hash": original_hash,
+        "description": "Maintenance record content altered without updating its integrity hash.",
+    }

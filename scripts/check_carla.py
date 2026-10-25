@@ -8,7 +8,7 @@ def main() -> int:
     try:
         import carla
 
-        client = carla.Client("127.0.0.1", 2000)
+        client = carla.Client("127.0.0.1", 2000)  # type: ignore # pyrefly: ignore[missing-attribute]
         client.set_timeout(5.0)
         version = client.get_server_version()
         world = client.get_world()
@@ -19,7 +19,7 @@ def main() -> int:
 
     print(f"CARLA_SERVER_VERSION: {version}")
     print(f"CARLA_MAP: {map_name}")
-    return 0 if str(version).strip() == "0.9.16" else 2
+    return 0 if str(version).strip() in ("0.9.15", "0.9.16") else 2
 
 
 if __name__ == "__main__":

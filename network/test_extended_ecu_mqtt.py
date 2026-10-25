@@ -17,6 +17,7 @@ import time
 import uuid
 from typing import Dict, List
 
+from blue_team.integrity_checker import IntegrityChecker
 from digital_twin.acu import ACU
 from digital_twin.bcm import BCM
 from digital_twin.bms import BMS
@@ -196,7 +197,8 @@ def main() -> int:
         mcu = MCU(state, vcu=vcu)
         tcu = TCU(state, carla_bridge)
         acu = ACU(state)
-        ota = OTAManager(state)
+        firmware_checker = IntegrityChecker(b"network-test-signing-key-32-bytes!!")
+        ota = OTAManager(state, firmware_checker)
 
         manager = DigitalTwinManager(
             vehicle_state=state,
@@ -286,15 +288,16 @@ def main() -> int:
         package_hash = ota.stage_update(
             version="1.2.0",
             package_data=package,
-            signature_valid=True,
+            signature=firmware_checker.sign_firmware_package(package),
         )
         ota_success = ota.install_update()
 
         # Tampered OTA must be rejected and must not change firmware.
+        tampered_package = b"tampered firmware package"
         ota.stage_update(
             version="9.9.9",
-            package_data=b"tampered firmware package",
-            signature_valid=False,
+            package_data=tampered_package,
+            signature=firmware_checker.sign_firmware_package(package),
         )
         tampered_ota_result = ota.install_update()
 

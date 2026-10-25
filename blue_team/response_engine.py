@@ -110,6 +110,12 @@ class ResponseEngine:
                 "last_action": self.last_action.to_dict() if self.last_action else None,
             }
 
+    def is_ecu_trusted(self, ecu: str) -> bool:
+        """Return whether telemetry from an ECU may be accepted as trusted."""
+        with self._lock:
+            normalized = ecu.strip().upper()
+            return normalized not in self.isolated_ecus and normalized not in self.untrusted_ecus
+
     def clear_runtime_state(self) -> None:
         """Reset transient response state for a fresh simulation session."""
         with self._lock:

@@ -119,6 +119,9 @@ a { text-decoration: none; }
 .report-grid { margin-top: 6px; }
 .export-row { display: flex; gap: 9px; margin-top: 6px; }
 .report-note { color: #6e839a; font-size: 11px; margin-top: 12px; line-height: 1.5; }
+.comparison-notice { border: 1px solid #294261; border-radius: 9px; padding: 10px 12px; margin: 0 0 12px; background: rgba(109,168,255,.07); color: #9fb4ca; font-size: 11px; line-height: 1.5; }
+.comparison-table { min-width: 760px; }
+.comparison-table td { vertical-align: top; line-height: 1.5; }
 
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }

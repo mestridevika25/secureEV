@@ -1,9 +1,9 @@
 $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$CarlaHome = if ($env:SECUREEV_CARLA_HOME) { $env:SECUREEV_CARLA_HOME } else { 'C:\SecureEV\CARLA' }
+$CarlaHome = if ($env:SECUREEV_CARLA_HOME) { $env:SECUREEV_CARLA_HOME } elseif (Test-Path 'C:\Carla\WindowsNoEditor\CarlaUE4.exe') { 'C:\Carla\WindowsNoEditor' } else { 'C:\SecureEV\CARLA' }
 $CarlaExe = Join-Path $CarlaHome 'CarlaUE4.exe'
-$PythonExe = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+$PythonExe = if (Test-Path (Join-Path $ProjectRoot 'venv_carla915\Scripts\python.exe')) { Join-Path $ProjectRoot 'venv_carla915\Scripts\python.exe' } else { Join-Path $ProjectRoot '.venv\Scripts\python.exe' }
 $FrontendRoot = Join-Path $ProjectRoot 'frontend'
 $env:SECUREEV_ENABLE_CAMERA = if ($env:SECUREEV_ENABLE_CAMERA) { $env:SECUREEV_ENABLE_CAMERA } else { '0' }
 
@@ -119,7 +119,7 @@ if (-not (Test-CarlaApi)) {
     Write-Host 'Or run: scripts\start_carla.bat' -ForegroundColor Cyan
     throw 'CARLA Python RPC API is not ready on localhost:2000.'
 }
-Write-Host 'CARLA 0.9.16 API: OK' -ForegroundColor Green
+Write-Host 'CARLA API: OK' -ForegroundColor Green
 
 # 3. FastAPI
 if (-not (Test-Port 8000)) {
@@ -159,7 +159,7 @@ if (-not (Test-Port 5173)) {
     Write-Host 'Starting React/Vite dashboard...'
     Start-Process powershell.exe `
         -WorkingDirectory $FrontendRoot `
-        -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-Command','npm run dev'
+        -ArgumentList '-NoExit','-ExecutionPolicy','Bypass','-Command','npm run dev -- --configLoader runner'
 }
 if (-not (Wait-Port 5173 30)) { throw 'Vite dashboard did not become available on port 5173.' }
 

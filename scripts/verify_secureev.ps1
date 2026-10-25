@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
-$PythonExe = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+$PythonExe = if (Test-Path (Join-Path $ProjectRoot 'venv_carla915\Scripts\python.exe')) { Join-Path $ProjectRoot 'venv_carla915\Scripts\python.exe' } else { Join-Path $ProjectRoot '.venv\Scripts\python.exe' }
 $FrontendRoot = Join-Path $ProjectRoot 'frontend'
 
 if (-not (Test-Path $PythonExe)) {

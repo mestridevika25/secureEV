@@ -79,3 +79,14 @@ class RecoveryRecord(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     restored_ecus: Mapped[list[str]] = mapped_column(JSON)
     details: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class MaintenanceLogRecord(Base):
+    __tablename__ = "maintenance_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entry_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    recorded_at: Mapped[str] = mapped_column(String(40))
+    data: Mapped[dict[str, Any]] = mapped_column(JSON)
+    previous_hash: Mapped[str] = mapped_column(String(64))
+    record_hash: Mapped[str] = mapped_column(String(64), index=True)

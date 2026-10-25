@@ -10,10 +10,14 @@ const ATTACKS = [
   { name: 'unauthorized_acceleration', label: 'Unauthorized Acceleration', target: 'VCU', kind: 'Control' },
   { name: 'out_of_range_control', label: 'Out-of-Range Control', target: 'VCU', kind: 'Control' },
   { name: 'unauthorized_command', label: 'Unauthorized Command', target: 'VCU', kind: 'Control' },
+  { name: 'replay_control', label: 'Replay Control', target: 'VCU', kind: 'Control' },
+  { name: 'cloud_update_attack', label: 'Tampered Cloud Update', target: 'OTA', kind: 'Firmware' },
+  { name: 'ecu_update_attack', label: 'Forged ECU Update', target: 'OTA', kind: 'Firmware' },
+  { name: 'maintenance_log_manipulation', label: 'Maintenance Log Tampering', target: 'DB', kind: 'Integrity', requiresRuntime: false },
 ];
 
 const emptySnapshot = {
-  runtime: { running: false, ecu_status: {}, control_bridge: {}, response: {}, camera: {}, autonomy: { enabled: false, mode: 'MANUAL', target_speed_kmh: 28, next_maneuver: null } },
+  runtime: { running: false, ecu_status: {}, control_bridge: {}, response: {}, integrity: { firmware_signature_configured: false, untrusted_ecus: [] }, camera: {}, autonomy: { enabled: false, mode: 'MANUAL', target_speed_kmh: 28, next_maneuver: null } },
   vehicle: {
     id: 'SEV-001', status: 'OFFLINE', speed_kmh: 0, acceleration_mps2: 0,
     battery_soc: 0, battery_temp: 0, motor_rpm: 0, motor_temp: 0,
@@ -120,8 +124,8 @@ export default function App() {
     if (busy) return;
     setBusy(true);
     try {
-      await fn();
-      setMessage(successMessage);
+      const result = await fn();
+      setMessage(result?.defended ? 'Attack detected and rejected by the defense.' : successMessage);
       const fresh = await api.getSnapshot();
       setSnapshot(fresh);
       if (refreshCamera) setCameraNonce(Date.now());
@@ -142,7 +146,7 @@ export default function App() {
     return action(() => api.startCamera(), 'CARLA camera enabled.', true);
   };
 
-  const launchAttack = (name) => action(() => api.launchAttack(name), `${name.replaceAll('_', ' ')} launched.`);
+  const launchAttack = (name) => action(() => api.launchAttack(name), `${name.replaceAll('_', ' ')} published.`);
   const sendControl = () => action(() => api.vehicleControl(control), 'VCU command sent through protected MQTT path.');
   const neutral = () => action(() => api.vehicleControl({ throttle: 0, brake: 0, steer: 0 }), 'Vehicle control set to neutral.');
   const startPatrol = () => action(() => api.startAutonomous(patrolSpeed), `Autonomous patrol started at ${patrolSpeed} km/h.`);
@@ -297,18 +301,21 @@ export default function App() {
           <section className="security-view">
             <div className="panel">
               <div className="panel-header"><div><h2>Red Team attack console</h2><p>Controlled attacks against the isolated SecureEV simulation</p></div></div>
+              <div className="comparison-notice">
+                Run a scenario here to record its protected result. The Reports tab pairs that observed result with a clearly labeled no-defense counterfactual; the live vehicle defenses are never switched off.
+              </div>
               <div className="attack-grid">
                 {ATTACKS.map((attack) => (
                   <div className="attack-card" key={attack.name}>
                     <div className="attack-name">{attack.label}</div>
                     <div className="attack-target">{attack.kind} · Target ECU: {attack.target}</div>
-                    <button className="btn danger full" disabled={busy || !isRunning} onClick={() => launchAttack(attack.name)}>Launch attack</button>
+                    <button className="btn danger full" disabled={busy || (attack.requiresRuntime !== false && !isRunning)} onClick={() => launchAttack(attack.name)}>Run scenario</button>
                   </div>
                 ))}
               </div>
             </div>
             <div className="two-column">
-              <div className="panel"><div className="panel-header"><div><h2>Latest attack</h2><p>Most recently requested scenario</p></div></div>{latestAttack ? <div className="detail-card"><div><span>Name</span><strong>{String(latestAttack.name).replaceAll('_', ' ')}</strong></div><div><span>ECU</span><strong>{latestAttack.ecu || latestAttack.target_ecu}</strong></div><div><span>Status</span><strong>{String(latestAttack.published).toUpperCase()}</strong></div></div> : <div className="empty-state">No attacks recorded.</div>}</div>
+              <div className="panel"><div className="panel-header"><div><h2>Latest attack</h2><p>Most recently requested scenario</p></div></div>{latestAttack ? <div className="detail-card"><div><span>Name</span><strong>{String(latestAttack.name).replaceAll('_', ' ')}</strong></div><div><span>ECU</span><strong>{latestAttack.ecu || latestAttack.target_ecu}</strong></div><div><span>Result</span><strong>{latestAttack.defended ? 'DEFENDED' : latestAttack.published ? latestAttack.outcome_status === 'unconfirmed' ? 'UNCONFIRMED' : 'PUBLISHED' : 'FAILED'}</strong></div></div> : <div className="empty-state">No attacks recorded.</div>}</div>
               <div className="panel"><div className="panel-header"><div><h2>Latest response</h2><p>Defensive action from the response engine</p></div></div>{latestResponse ? <div className="detail-card"><div><span>Action</span><strong>{latestResponse.action}</strong></div><div><span>ECU</span><strong>{latestResponse.ecu}</strong></div><div><span>Severity</span><strong>{latestResponse.severity}</strong></div></div> : <div className="empty-state">No response recorded.</div>}</div>
             </div>
             <div className="panel"><div className="panel-header"><div><h2>Security event stream</h2><p>Current and persisted security events</p></div></div><div className="alert-list">{snapshot.security?.recent_events?.length ? snapshot.security.recent_events.slice().reverse().map((a, i) => <AlertRow key={`${a.id || a.timestamp}-${i}`} alert={a} />) : <div className="empty-state">No security events.</div>}</div></div>
@@ -328,11 +335,14 @@ export default function App() {
               {evaluation ? (
                 <div className="report-grid">
                   <MetricCard label="Attacks launched" value={evaluation.attacks_launched} />
+                  <MetricCard label="Attacks defended" value={evaluation.attacks_defended} />
                   <MetricCard label="Telemetry records" value={evaluation.telemetry_records} />
                   <MetricCard label="Security events" value={evaluation.security_events} />
                   <MetricCard label="Response actions" value={evaluation.responses_recorded} />
                   <MetricCard label="Executed responses" value={evaluation.responses_executed} />
                   <MetricCard label="Recovery events" value={evaluation.recovery_events} />
+                  <MetricCard label="Firmware key" value={evaluation.firmware_signature_configured ? 'Configured' : 'Not configured'} />
+                  <MetricCard label="Maintenance log chain" value={evaluation.maintenance_log_chain_valid === null ? 'Not checked' : evaluation.maintenance_log_chain_valid ? 'Valid' : 'TAMPERED'} />
                 </div>
               ) : <div className="empty-state">Loading evaluation…</div>}
               <div className="export-row">
@@ -340,6 +350,35 @@ export default function App() {
                 <a className="btn secondary" href={reportUrl('csv')} download="secureev_report.csv">Export CSV</a>
               </div>
               <div className="report-note">{evaluation?.note || 'Metrics are calculated from recorded project events.'}</div>
+            </div>
+            <div className="panel">
+              <div className="panel-header"><div><h2>Attack vs defense comparison</h2><p>Observed protected run compared with the expected impact if its defense were absent</p></div></div>
+              <div className="comparison-notice">
+                “Protected” is the result actually returned by the running simulation. “Without defense” is a scenario-based counterfactual, not a second live attack; defenses stay enabled and no unsafe command is sent to CARLA.
+              </div>
+              {history.attacks.length ? (
+                <div className="table-wrap">
+                  <table className="comparison-table">
+                    <thead><tr><th>Scenario</th><th>Protected run · observed</th><th>Evidence</th><th>Without defense · counterfactual</th></tr></thead>
+                    <tbody>
+                      {history.attacks.slice().reverse().map((attack, index) => {
+                        const comparison = attack.comparison;
+                        const protectedRun = comparison?.protected;
+                        const noDefense = comparison?.without_defense;
+                        return (
+                          <tr key={`${attack.id || attack.timestamp || attack.name}-${index}`}>
+                            <td>{String(attack.name || 'Attack').replaceAll('_', ' ')}</td>
+                            <td><span className={`pill ${protectedRun?.defended ? 'pill-ok' : 'pill-warn'}`}>{protectedRun?.status || (attack.defended ? 'BLOCKED_OR_MITIGATED' : 'NOT_CAPTURED')}</span></td>
+                            <td>{protectedRun?.evidence || attack.defense_reason || attack.reason || 'No defense evidence saved for this historical run.'}</td>
+                            <td>{noDefense?.expected_effect || 'Counterfactual was not recorded for this historical run.'}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : <div className="empty-state">No attacks recorded yet. Run a scenario from the Security tab to generate a comparison.</div>}
+              <div className="report-note">Find direct defense evidence in Security → Latest attack, Latest response, and Security event stream. Older attack records created before this comparison feature may not include a saved comparison.</div>
             </div>
             <div className="panel"><div className="panel-header"><div><h2>Latest recovery</h2><p>Safe-state restoration status</p></div></div>{latestRecovery ? <div className="detail-card"><div><span>Status</span><strong>{latestRecovery.status}</strong></div><div><span>Vehicle</span><strong>{latestRecovery.vehicle_id}</strong></div><div><span>Restored</span><strong>{latestRecovery.restored_ecus?.length || 0} ECUs</strong></div></div> : <div className="empty-state">No recovery event recorded yet.</div>}</div>
           </section>

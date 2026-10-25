@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 
+from blue_team.integrity_checker import IntegrityChecker
 from simulation.carla_bridge import CarlaBridge
 
 from digital_twin.vehicle_state import VehicleState
@@ -75,7 +76,8 @@ def main() -> None:
 
         print("[4] Creating Phase 3 modules...", flush=True)
         camera = CameraModule(state, bridge)
-        ota = OTAManager(state)
+        firmware_checker = IntegrityChecker(b"phase3-test-signing-key-32-bytes!!")
+        ota = OTAManager(state, firmware_checker)
 
         manager = DigitalTwinManager(
             vehicle_state=state,
@@ -149,7 +151,7 @@ def main() -> None:
         package_hash = ota.stage_update(
             version="1.1.0",
             package_data=package,
-            signature_valid=True,
+            signature=firmware_checker.sign_firmware_package(package),
         )
 
         ota_success = ota.install_update()
@@ -162,10 +164,11 @@ def main() -> None:
         )
 
         print("\n[9] Testing rejected OTA...", flush=True)
+        tampered_package = b"tampered firmware"
         ota.stage_update(
             version="9.9.9",
-            package_data=b"tampered firmware",
-            signature_valid=False,
+            package_data=tampered_package,
+            signature=firmware_checker.sign_firmware_package(package),
         )
 
         rejected_install = ota.install_update()

@@ -49,9 +49,11 @@ No NumPy is used.
 from __future__ import annotations
 
 import time
+import os
 
 import pygame
 
+from blue_team.integrity_checker import IntegrityChecker
 from simulation.carla_bridge import CarlaBridge
 
 from digital_twin.vehicle_state import VehicleState
@@ -217,7 +219,11 @@ def main() -> None:
         acu = ACU(state)
         acu.max_throttle = AUTONOMOUS_MAX_THROTTLE
         camera = CameraModule(state, bridge)
-        ota = OTAManager(state)
+        firmware_key = os.getenv("SECUREEV_FIRMWARE_SIGNING_KEY")
+        firmware_checker = IntegrityChecker(
+            firmware_key.encode("utf-8") if firmware_key else None
+        )
+        ota = OTAManager(state, firmware_checker)
 
         manager = DigitalTwinManager(
             vehicle_state=state,
@@ -401,7 +407,7 @@ def main() -> None:
                             package_hash = ota.stage_update(
                                 version=version,
                                 package_data=package,
-                                signature_valid=True,
+                                signature=firmware_checker.sign_firmware_package(package),
                             )
                             success = ota.install_update()
                             if success:

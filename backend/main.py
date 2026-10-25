@@ -19,6 +19,7 @@ from sqlalchemy import func, select
 
 from backend.runtime import SecureEVRuntime
 from database.db import SessionLocal, init_db
+from database.models import MaintenanceLogRecord
 from database.models import (
     AttackRecord,
     RecoveryRecord,
@@ -26,8 +27,23 @@ from database.models import (
     SecurityEventRecord,
     TelemetryRecord,
 )
+from blue_team.integrity_checker import IntegrityChecker
+from red_team.data_integrity_attacks import maintenance_log_manipulation
 
 VEHICLE_ID = "SEV-001"
+
+UNPROTECTED_ATTACK_EFFECTS = {
+    "gps_spoofing": "False GPS data could be accepted as trusted position telemetry.",
+    "speed_spoofing": "False speed data could be trusted by downstream vehicle logic or displays.",
+    "battery_soc_spoofing": "False battery state-of-charge data could be trusted by downstream consumers.",
+    "unauthorized_acceleration": "An unauthorized acceleration command could reach downstream VCU control checks.",
+    "out_of_range_control": "An out-of-range control command could reach downstream VCU control checks.",
+    "unauthorized_command": "An unauthorized command could reach downstream VCU command handling.",
+    "replay_control": "A previously observed control message could be accepted if replay checks were absent.",
+    "cloud_update_attack": "A tampered cloud firmware package could be installed without signature verification.",
+    "ecu_update_attack": "A forged ECU firmware package could be installed without signature verification.",
+    "maintenance_log_manipulation": "Modified maintenance data could remain in the database without a tamper alert.",
+}
 
 
 class ControlRequest(BaseModel):
@@ -57,6 +73,7 @@ class SecureEVService:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.runtime = SecureEVRuntime(event_callback=self.handle_runtime_event)
+        self.integrity_checker = self.runtime.integrity_checker
         self.current_telemetry: dict[str, dict[str, Any]] = {}
         self.alerts: list[dict[str, Any]] = []
         self.attack_history: list[dict[str, Any]] = []
@@ -166,7 +183,33 @@ class SecureEVService:
             self._persist_security_event(event)
             return
 
+        if event_type == "telemetry_quarantined":
+            self._append(self.security_events, {**event, "type": "security_event", "severity": "HIGH"})
+            self._persist_security_event({**event, "type": "security_event", "severity": "HIGH"})
+            return
+
+        if event_type == "integrity_finding" and event.get("detected"):
+            self._append(self.alerts, event)
+            self._append(self.security_events, event)
+            self._persist_security_event(event)
+            response = {
+                "type": "response_action",
+                "timestamp": event.get("timestamp", time.time()),
+                "action": str(event.get("action", "integrity_rejected")),
+                "ecu": str(event.get("ecu") or ("DB" if "maintenance" in str(event.get("event_type")) else "OTA")),
+                "attack_type": str(event.get("attack_type", "integrity_violation")),
+                "severity": str(event.get("severity", "HIGH")),
+                "executed": True,
+                "reason": str(event.get("reason", "Integrity policy rejected the change.")),
+            }
+            self._append(self.response_history, response)
+            self._persist_response(response)
+            return
+
         if event_type == "response_action":
+            if event.get("action") in {"isolate_ecu", "mark_untrusted"}:
+                with self._lock:
+                    self.current_telemetry.pop(str(event.get("ecu", "")).upper(), None)
             self._append(self.response_history, event)
             self._persist_response(event)
             return
@@ -215,12 +258,130 @@ class SecureEVService:
                     name=item["name"],
                     target_ecu=item.get("ecu"),
                     topic=item.get("topic"),
-                    status="published" if item.get("published") else "failed",
+                    status=(
+                        "defended"
+                        if item.get("defended")
+                        else "published" if item.get("published") else "failed"
+                    ),
                     description=item.get("description"),
                     details=item,
                 )
             )
             db.commit()
+
+    @staticmethod
+    def add_attack_comparison(result: dict[str, Any]) -> dict[str, Any]:
+        name = str(result.get("name", ""))
+        published = bool(result.get("published"))
+        detected = bool(result.get("detected"))
+        defended = bool(result.get("defended"))
+        if not published:
+            protected_status = "FAILED"
+        elif defended:
+            protected_status = "BLOCKED_OR_MITIGATED"
+        elif detected:
+            protected_status = "DETECTED_MITIGATION_UNCONFIRMED"
+        else:
+            protected_status = "OUTCOME_UNCONFIRMED"
+
+        evidence = (
+            result.get("defense_reason")
+            or result.get("reason")
+            or (
+                "The attack response confirms detection and mitigation."
+                if defended
+                else "No confirmed detection or mitigation was returned for this run."
+            )
+        )
+        result["comparison"] = {
+            "protected": {
+                "status": protected_status,
+                "detected": detected,
+                "defended": defended,
+                "evidence": str(evidence),
+            },
+            "without_defense": {
+                "status": "COUNTERFACTUAL_NOT_RUN",
+                "expected_effect": UNPROTECTED_ATTACK_EFFECTS.get(
+                    name,
+                    "The attack may pass without its corresponding defense; downstream impact is not simulated.",
+                ),
+            },
+            "note": (
+                "Only the protected attack was run. The no-defense result is a "
+                "scenario-based counterfactual; protections were not disabled."
+            ),
+        }
+        return result
+
+    def launch_attack(self, name: str) -> dict[str, Any]:
+        if name != "maintenance_log_manipulation":
+            return self.add_attack_comparison(self.runtime.launch_attack(name))
+
+        with SessionLocal() as db:
+            rows = list(db.scalars(select(MaintenanceLogRecord).order_by(MaintenanceLogRecord.id)))
+            if not rows:
+                entry = self.integrity_checker.create_log_entry(
+                    entry_id="maintenance-baseline",
+                    recorded_at=datetime.now(timezone.utc).isoformat(),
+                    data={"inspection": "passed", "source": "service"},
+                    previous_hash="0" * 64,
+                )
+                row = MaintenanceLogRecord(**entry)
+                db.add(row)
+                db.commit()
+                rows = [row]
+
+            target = rows[-1]
+            entry = {
+                "entry_id": target.entry_id,
+                "recorded_at": target.recorded_at,
+                "data": dict(target.data),
+                "previous_hash": target.previous_hash,
+                "record_hash": target.record_hash,
+            }
+            details = maintenance_log_manipulation(entry)
+            target.data = entry["data"]
+            db.commit()
+            records = list(db.scalars(select(MaintenanceLogRecord).order_by(MaintenanceLogRecord.id)))
+            verified = self.integrity_checker.verify_log_chain(
+                [
+                    {
+                        "entry_id": record.entry_id,
+                        "recorded_at": record.recorded_at,
+                        "data": record.data,
+                        "previous_hash": record.previous_hash,
+                        "record_hash": record.record_hash,
+                    }
+                    for record in records
+                ]
+            )
+
+        detected = not verified
+        event = {
+            "type": "integrity_finding",
+            "event_type": "maintenance_log_integrity",
+            "attack_type": name,
+            "severity": "HIGH",
+            "detected": detected,
+            "action": "tampering_detected" if detected else "no_tampering_detected",
+            "reason": "Maintenance log hash chain verification failed." if detected else "Maintenance log chain verified.",
+            "timestamp": time.time(),
+            **details,
+        }
+        self.handle_runtime_event(event)
+        result = {
+            "name": name,
+            "topic": "database/maintenance_logs",
+            "ecu": "DB",
+            "description": details["description"],
+            "published": True,
+            "detected": detected,
+            "defended": detected,
+            "reason": event["reason"],
+            "timestamp": event["timestamp"],
+        }
+        return self.add_attack_comparison(result)
 
     def _persist_telemetry(self, item: dict[str, Any]) -> None:
         with SessionLocal() as db:
@@ -280,6 +441,12 @@ class SecureEVService:
         return {
             "timestamp": time.time(),
             "runtime": self.runtime.get_runtime_status(),
+            "integrity": {
+                "firmware_signature_configured": self.integrity_checker.firmware_verification_configured,
+                "untrusted_ecus": self.runtime.response_engine.get_status()["untrusted_ecus"]
+                if self.runtime.response_engine is not None
+                else [],
+            },
             "vehicle": {
                 "id": VEHICLE_ID,
                 "status": "ONLINE" if self.runtime.running else "OFFLINE",
@@ -309,6 +476,9 @@ class SecureEVService:
     def evaluation(self) -> dict[str, Any]:
         with SessionLocal() as db:
             attacks = db.scalar(select(func.count()).select_from(AttackRecord)) or 0
+            defended_attacks = db.scalar(
+                select(func.count()).select_from(AttackRecord).where(AttackRecord.status == "defended")
+            ) or 0
             telemetry = db.scalar(select(func.count()).select_from(TelemetryRecord)) or 0
             security = db.scalar(select(func.count()).select_from(SecurityEventRecord)) or 0
             responses = db.scalar(select(func.count()).select_from(ResponseRecord)) or 0
@@ -316,15 +486,38 @@ class SecureEVService:
                 select(func.count()).select_from(ResponseRecord).where(ResponseRecord.executed.is_(True))
             ) or 0
             recovered = db.scalar(select(func.count()).select_from(RecoveryRecord)) or 0
+            maintenance = list(
+                db.scalars(select(MaintenanceLogRecord).order_by(MaintenanceLogRecord.id))
+            )
+
+        maintenance_chain_valid = (
+            self.integrity_checker.verify_log_chain(
+                [
+                    {
+                        "entry_id": row.entry_id,
+                        "recorded_at": row.recorded_at,
+                        "data": row.data,
+                        "previous_hash": row.previous_hash,
+                        "record_hash": row.record_hash,
+                    }
+                    for row in maintenance
+                ]
+            )
+            if maintenance
+            else None
+        )
 
         return {
             "generated_at": time.time(),
             "attacks_launched": attacks,
+            "attacks_defended": defended_attacks,
             "telemetry_records": telemetry,
             "security_events": security,
             "responses_recorded": responses,
             "responses_executed": executed_responses,
             "recovery_events": recovered,
+            "maintenance_log_chain_valid": maintenance_chain_valid,
+            "firmware_signature_configured": self.integrity_checker.firmware_verification_configured,
             "runtime_running": self.runtime.running,
             "false_positive_rate": None,
             "detection_time_ms": None,
@@ -389,6 +582,16 @@ def security_alerts(limit: int = Query(default=50, ge=1, le=200)) -> list[dict[s
 @app.get("/security/status")
 def security_status() -> dict[str, Any]:
     return {"risk": service._risk_status(), "runtime": service.runtime.get_runtime_status()}
+
+
+@app.get("/security/integrity")
+def security_integrity() -> dict[str, Any]:
+    report = service.evaluation()
+    return {
+        "firmware_signature_configured": report["firmware_signature_configured"],
+        "maintenance_log_chain_valid": report["maintenance_log_chain_valid"],
+        "untrusted_ecus": service.runtime.get_runtime_status()["integrity"]["untrusted_ecus"],
+    }
 
 
 @app.get("/attacks")
@@ -488,7 +691,7 @@ def emergency_brake() -> dict[str, Any]:
 @app.post("/attacks/launch")
 def launch_attack(request: AttackRequest) -> dict[str, Any]:
     try:
-        result = service.runtime.launch_attack(request.name)
+        result = service.launch_attack(request.name.strip().lower())
     except (RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     service.record_attack(result)
@@ -566,13 +769,36 @@ def report_export() -> JSONResponse:
 def report_export_csv() -> Response:
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["time", "type", "event", "ecu", "severity", "status", "reason"])
+    writer.writerow([
+        "time",
+        "type",
+        "event",
+        "ecu",
+        "severity",
+        "status",
+        "reason",
+        "protected_outcome",
+        "without_defense_counterfactual",
+    ])
     for attack in service.attack_history[-200:]:
-        writer.writerow([attack.get("timestamp") or attack.get("recorded_at"), "ATTACK", attack.get("name"), attack.get("target_ecu") or attack.get("ecu"), "", attack.get("status"), attack.get("description", "")])
+        comparison = attack.get("comparison") or {}
+        protected = comparison.get("protected") or {}
+        unprotected = comparison.get("without_defense") or {}
+        writer.writerow([
+            attack.get("timestamp") or attack.get("recorded_at"),
+            "ATTACK",
+            attack.get("name"),
+            attack.get("target_ecu") or attack.get("ecu"),
+            "",
+            attack.get("status"),
+            protected.get("evidence") or attack.get("description", ""),
+            protected.get("status", "NOT_CAPTURED"),
+            unprotected.get("expected_effect", "Not available for this historical run."),
+        ])
     for response in service.response_history[-200:]:
-        writer.writerow([response.get("timestamp") or response.get("recorded_at"), "RESPONSE", response.get("action"), response.get("ecu"), response.get("severity"), "EXECUTED" if response.get("executed") else "FAILED", response.get("reason", "")])
+        writer.writerow([response.get("timestamp") or response.get("recorded_at"), "RESPONSE", response.get("action"), response.get("ecu"), response.get("severity"), "EXECUTED" if response.get("executed") else "FAILED", response.get("reason", ""), "", ""])
     for event in service.security_events[-200:]:
-        writer.writerow([event.get("timestamp") or event.get("recorded_at"), "SECURITY", event.get("attack_type") or event.get("event_type"), event.get("ecu"), event.get("severity"), event.get("action") or ("DETECTED" if event.get("detected") else "RECORDED"), event.get("reason", "")])
+        writer.writerow([event.get("timestamp") or event.get("recorded_at"), "SECURITY", event.get("attack_type") or event.get("event_type"), event.get("ecu"), event.get("severity"), event.get("action") or ("DETECTED" if event.get("detected") else "RECORDED"), event.get("reason", ""), "", ""])
     return Response(content=buffer.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="secureev_report.csv"'})
 
 

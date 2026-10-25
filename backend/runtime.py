@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Callable, Iterator
 
 from blue_team.ground_truth_validator import GroundTruthValidator
+from blue_team.integrity_checker import IntegrityChecker
 from blue_team.response_engine import ResponseEngine
 from blue_team.runtime_response import RuntimeResponseCoordinator
 from blue_team.security_gateway import SecurityGateway
@@ -47,6 +48,7 @@ from network.publisher import MQTTPublisher
 from network.subscriber import MQTTSubscriber
 from red_team.control_injection import ControlInjectionAttacker
 from red_team.data_spoofing import DataSpoofingAttacker
+from red_team.firmware_attacks import FirmwareAttacker
 from simulation.carla_bridge import CarlaBridge
 
 ECU_TOPICS = {
@@ -77,7 +79,11 @@ class SecureEVRuntime:
     ) -> None:
         self.event_callback = event_callback
         self._lock = threading.RLock()
+        self._attack_condition = threading.Condition()
+        self._telemetry_outcomes: dict[str, dict[str, Any]] = {}
+        self._control_outcomes: dict[str, dict[str, Any]] = {}
         self._stop_event = threading.Event()
+        self._quarantine_reported: set[str] = set()
         self._thread: threading.Thread | None = None
 
         self.running = False
@@ -112,9 +118,14 @@ class SecureEVRuntime:
         self.response_engine: ResponseEngine | None = None
         self.runtime_response: RuntimeResponseCoordinator | None = None
         self.ground_truth_validator = GroundTruthValidator()
+        firmware_key = os.getenv("SECUREEV_FIRMWARE_SIGNING_KEY")
+        self.integrity_checker = IntegrityChecker(
+            firmware_key.encode("utf-8") if firmware_key else None
+        )
 
         self.control_attacker: ControlInjectionAttacker | None = None
         self.data_attacker: DataSpoofingAttacker | None = None
+        self.firmware_attacker = FirmwareAttacker()
 
     def start(self) -> tuple[bool, str]:
         with self._lock:
@@ -123,6 +134,11 @@ class SecureEVRuntime:
             self.start_error = None
             self.camera_enabled = CAMERA_ENABLED_BY_DEFAULT
             self._stop_event.clear()
+            self._quarantine_reported.clear()
+
+        with self._attack_condition:
+            self._telemetry_outcomes.clear()
+            self._control_outcomes.clear()
 
         bridge: CarlaBridge | None = None
         publisher: MQTTPublisher | None = None
@@ -148,7 +164,7 @@ class SecureEVRuntime:
             tcu = TCU(state, bridge)
             acu = ACU(state)
             camera = CameraModule(state, bridge)
-            ota = OTAManager(state)
+            ota = OTAManager(state, self.integrity_checker)
 
             # Keep the established 10 Hz Digital Twin timing.  The spectator
             # is smoothed independently, so increasing the ECU rate is not
@@ -314,6 +330,7 @@ class SecureEVRuntime:
                 pass
         if self.response_engine is not None:
             self.response_engine.clear_runtime_state()
+        self._quarantine_reported.clear()
         if self.runtime_response is not None:
             self.runtime_response.handled_findings = 0
             self.runtime_response.detected_findings = 0
@@ -416,17 +433,24 @@ class SecureEVRuntime:
             pass
 
     def _on_telemetry_message(self, topic: str, payload: dict[str, Any]) -> None:
-        self._emit(
-            {
-                "type": "telemetry",
-                "topic": topic,
-                "payload": payload,
-                "timestamp": time.time(),
-            }
-        )
-
         ecu = str(payload.get("ecu", "")).upper()
+        if self.response_engine is not None and not self.response_engine.is_ecu_trusted(ecu):
+            if ecu not in self._quarantine_reported:
+                self._quarantine_reported.add(ecu)
+                self._emit(
+                    {
+                        "type": "telemetry_quarantined",
+                        "ecu": ecu,
+                        "topic": topic,
+                        "message_id": payload.get("message_id"),
+                        "reason": "ECU is isolated after a confirmed integrity finding",
+                        "timestamp": time.time(),
+                    }
+                )
+            return
+
         if ecu not in VALIDATED_TELEMETRY_ECUS:
+            self._emit({"type": "telemetry", "topic": topic, "payload": payload, "timestamp": time.time()})
             return
 
         try:
@@ -441,6 +465,18 @@ class SecureEVRuntime:
                 carla_ground_truth=ground_truth,
                 trusted_battery_soc=trusted_soc,
             )
+            message_id = payload.get("message_id")
+            if isinstance(message_id, str):
+                with self._attack_condition:
+                    self._telemetry_outcomes[message_id] = {
+                        "detected": finding.detected,
+                        "attack_type": finding.attack_type,
+                        "reason": finding.reason,
+                    }
+                    if len(self._telemetry_outcomes) > 500:
+                        self._telemetry_outcomes.pop(next(iter(self._telemetry_outcomes)))
+                    self._attack_condition.notify_all()
+            trusted = not finding.detected
             self._emit(
                 {
                     "type": "telemetry_finding",
@@ -501,6 +537,8 @@ class SecureEVRuntime:
                             "reason": action.reason,
                         }
                     )
+            if trusted:
+                self._emit({"type": "telemetry", "topic": topic, "payload": payload, "timestamp": time.time()})
         except Exception as exc:
             self._emit(
                 {
@@ -512,6 +550,17 @@ class SecureEVRuntime:
             )
 
     def _on_security_event(self, event: Any) -> None:
+        message_id = getattr(event, "message_id", None)
+        if isinstance(message_id, str):
+            with self._attack_condition:
+                self._control_outcomes[message_id] = {
+                    "action": event.action,
+                    "reason": event.reason,
+                }
+                if len(self._control_outcomes) > 500:
+                    self._control_outcomes.pop(next(iter(self._control_outcomes)))
+                self._attack_condition.notify_all()
+
         self._emit(
             {
                 "type": "security_gateway",
@@ -609,6 +658,12 @@ class SecureEVRuntime:
                 "last_rejection_reason": control.last_rejection_reason if control else None,
             },
             "response": response.status() if response else {},
+            "integrity": {
+                "firmware_signature_configured": self.integrity_checker.firmware_verification_configured,
+                "untrusted_ecus": response.response_engine.get_status()["untrusted_ecus"]
+                if response is not None
+                else [],
+            },
             "camera": self.camera_status(),
             "autonomy": self.bridge.get_autonomy_status() if self.bridge is not None else {"enabled": False, "mode": "MANUAL"},
         }
@@ -756,15 +811,127 @@ class SecureEVRuntime:
         elif name == "unauthorized_command":
             assert self.control_attacker is not None
             scenario = self.control_attacker.unauthorized_command(sequence=sequence + 2)
+        elif name == "replay_control":
+            self.control_sequence += 1
+            message = create_vcu_control_message(
+                command="set_control",
+                data={"throttle": 0.0, "brake": 0.0, "steer": 0.0},
+                sequence=self.control_sequence,
+                vehicle_id=VEHICLE_ID,
+            )
+            self.publisher.publish("secureev/vcu/control", message, qos=1)
+            scenario = self.control_attacker.replay_control(message)
+        elif name in {"cloud_update_attack", "ecu_update_attack"}:
+            if self.ota is None:
+                raise RuntimeError("OTA Manager is not available.")
+            if name == "cloud_update_attack":
+                trusted_package = b"SecureEV signed firmware package"
+                trusted_signature = (
+                    self.integrity_checker.sign_firmware_package(trusted_package)
+                    if self.integrity_checker.firmware_verification_configured
+                    else ""
+                )
+                scenario = self.firmware_attacker.cloud_update_attack(
+                    "1.0.1", trusted_package, trusted_signature
+                ) if trusted_signature else None
+            else:
+                scenario = self.firmware_attacker.ecu_update_attack(
+                    "1.0.1", b"SecureEV local firmware package"
+                )
+            if scenario is None:
+                event = {
+                    "type": "integrity_finding",
+                    "event_type": "firmware_integrity",
+                    "attack_type": name,
+                    "severity": "HIGH",
+                    "detected": True,
+                    "action": "update_rejected",
+                    "reason": "Firmware signing key is not configured; update was rejected by default.",
+                    "timestamp": time.time(),
+                }
+                self._emit(event)
+                self.ota.reject_update(event["reason"])
+                return {
+                    "name": name,
+                    "topic": "ota/firmware",
+                    "ecu": "OTA",
+                    "description": "Unsigned/tampered firmware update rejected.",
+                    "published": True,
+                    "detected": True,
+                    "defended": True,
+                    "defense_reason": event["reason"],
+                    "timestamp": event["timestamp"],
+                }
+
+            self.ota.stage_update(scenario.version, scenario.package, scenario.signature)
+            installed = self.ota.install_update()
+            if installed:
+                raise RuntimeError("Tampered firmware unexpectedly passed signature verification.")
+            reason = self.ota.last_error or "Firmware signature verification failed; update rejected."
+            self._emit(
+                {
+                    "type": "integrity_finding",
+                    "event_type": "firmware_integrity",
+                    "attack_type": name,
+                    "severity": "HIGH",
+                    "detected": True,
+                    "action": "update_rejected",
+                    "reason": reason,
+                    "timestamp": time.time(),
+                }
+            )
+            return {
+                "name": name,
+                "topic": "ota/firmware",
+                "ecu": "OTA",
+                "description": scenario.description,
+                "published": True,
+                "detected": True,
+                "defended": True,
+                "defense_reason": reason,
+                "timestamp": time.time(),
+            }
         else:
             raise ValueError(f"Unsupported attack: {name}")
 
         published = self.publisher.publish(scenario.topic, scenario.message, qos=1)
+        outcome = self._await_attack_outcome(
+            name,
+            str(scenario.message.get("message_id", "")),
+        ) if published else None
         return {
             "name": scenario.name,
             "topic": scenario.topic,
             "ecu": getattr(scenario, "ecu", "VCU"),
             "description": scenario.description,
             "published": bool(published),
+            "detected": bool(outcome and outcome.get("detected")),
+            "defended": bool(outcome and outcome.get("defended")),
+            "outcome_status": "confirmed" if outcome and outcome.get("defended") else "unconfirmed",
+            "defense_reason": outcome.get("reason") if outcome else None,
             "timestamp": time.time(),
         }
+
+    def _await_attack_outcome(
+        self,
+        name: str,
+        message_id: str,
+        timeout: float = 2.0,
+    ) -> dict[str, Any] | None:
+        """Wait briefly for the subscriber-side decision on this exact packet."""
+        deadline = time.monotonic() + timeout
+        with self._attack_condition:
+            while True:
+                if name in {"gps_spoofing", "speed_spoofing", "battery_soc_spoofing"}:
+                    outcome = self._telemetry_outcomes.get(message_id)
+                    if outcome is not None and outcome.get("detected"):
+                        return {"detected": True, "defended": True, "reason": outcome["reason"]}
+                else:
+                    outcome = self._control_outcomes.get(message_id)
+                    if outcome is not None and outcome.get("action") == "BLOCK":
+                        return {"detected": True, "defended": True, "reason": outcome["reason"]}
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._attack_condition.wait(remaining)

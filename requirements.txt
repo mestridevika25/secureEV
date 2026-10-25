@@ -1,13 +1,13 @@
 # ============================================================
 # SecureEV
 # Attack Resistant Cybersecurity Measures for Next-Gen Connected EVs
-# Current Development Environment: CARLA 0.9.16 + Python 3.10
+# Current Development Environment: CARLA 0.9.15 + Python 3.10
 # ============================================================
 
 # ------------------------------------------------------------
 # PHASE 1-3: CARLA + Simulation + Manual Driving
 # ------------------------------------------------------------
-carla==0.9.16
+carla==0.9.15
 pygame>=2.5.0,<2.7.0
 Pillow>=10.0.0
 

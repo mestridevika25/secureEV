@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-$CarlaHome = if ($env:SECUREEV_CARLA_HOME) { $env:SECUREEV_CARLA_HOME } else { 'C:\SecureEV\CARLA' }
+$CarlaHome = if ($env:SECUREEV_CARLA_HOME) { $env:SECUREEV_CARLA_HOME } elseif (Test-Path 'C:\Carla\WindowsNoEditor\CarlaUE4.exe') { 'C:\Carla\WindowsNoEditor' } else { 'C:\SecureEV\CARLA' }
 $CarlaExe = Join-Path $CarlaHome 'CarlaUE4.exe'
 if (-not (Test-Path $CarlaExe)) { throw "CARLA executable not found at $CarlaExe" }
 

@@ -1063,3 +1063,42 @@ Use `scripts\\start_all.bat` after first-time Python/frontend setup. The launche
 ## Autonomous patrol mode
 
 The live application starts the SecureEV vehicle in an autonomous city-patrol mode by default. CARLA Traffic Manager controls the Tesla on the road network and provides dynamic urban path selection, traffic-aware following and lane behaviour. FastAPI exposes explicit autonomous/manual mode controls. During autonomous operation, confirmed HIGH/CRITICAL telemetry integrity findings cause a safe stop; the recovery endpoint restores the vehicle and resumes patrol.
+
+## Security scenario coverage
+
+The dashboard's local scenario console includes control-message injection and
+replay, VCU/BMS/TCU telemetry spoofing, firmware tampering, and maintenance-log
+tampering. Control messages are checked by the Security Gateway; supported
+telemetry is compared against CARLA/digital-twin references; modified firmware
+is rejected by OTA signature verification; and maintenance-record changes are
+checked against the stored hash chain. Confirmed telemetry findings quarantine
+that ECU's telemetry from the trusted live view until recovery.
+
+After running an attack from the dashboard's **Security** tab, open **Reports**
+to see its observed protected outcome, defense evidence, and the expected
+counterfactual impact without that defense. The no-defense column is not a
+second live run: it is derived from the scenario description, and protections
+remain enabled so the comparison does not send unprotected commands to CARLA.
+Direct event evidence is also available in Security under **Latest attack**,
+**Latest response**, and **Security event stream**. JSON and CSV exports include
+the comparison for newly recorded attacks.
+
+Firmware verification fails closed unless the backend process has a
+`SECUREEV_FIRMWARE_SIGNING_KEY` environment variable containing at least 32
+characters. For a local PowerShell session, set a private random value before
+starting the backend, for example:
+
+```powershell
+$bytes = New-Object byte[] 32
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+$rng.Dispose()
+$env:SECUREEV_FIRMWARE_SIGNING_KEY = [Convert]::ToBase64String($bytes)
+```
+
+The firmware key must remain private; do not put it in frontend code or commit
+it. Without a configured key, firmware updates are rejected. The maintenance
+log hash chain is tamper-evident for the simulated content-only manipulation
+scenario; it is not a defense against an attacker who can rewrite the database
+and recompute the entire chain. These controls are for a local academic
+simulation and are not automotive-grade security mechanisms.

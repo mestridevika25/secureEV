@@ -23,6 +23,7 @@ def test_person2_routes_are_present() -> None:
         "/ecus",
         "/security/alerts",
         "/security/status",
+        "/security/integrity",
         "/attacks",
         "/responses",
         "/runtime/status",
