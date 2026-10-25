@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import copy
 import io
 import threading
 import time
@@ -31,6 +32,11 @@ from blue_team.integrity_checker import IntegrityChecker
 from red_team.data_integrity_attacks import maintenance_log_manipulation
 
 VEHICLE_ID = "SEV-001"
+SUPPORTED_ATTACK_NAMES = {
+    "gps_spoofing",
+    "battery_soc_spoofing",
+    "unauthorized_acceleration",
+}
 
 UNPROTECTED_ATTACK_EFFECTS = {
     "gps_spoofing": "False GPS data could be accepted as trusted position telemetry.",
@@ -258,11 +264,7 @@ class SecureEVService:
                     name=item["name"],
                     target_ecu=item.get("ecu"),
                     topic=item.get("topic"),
-                    status=(
-                        "defended"
-                        if item.get("defended")
-                        else "published" if item.get("published") else "failed"
-                    ),
+                    status="executed" if item.get("published") else "failed",
                     description=item.get("description"),
                     details=item,
                 )
@@ -340,9 +342,8 @@ class SecureEVService:
                 "previous_hash": target.previous_hash,
                 "record_hash": target.record_hash,
             }
-            details = maintenance_log_manipulation(entry)
-            target.data = entry["data"]
-            db.commit()
+            tampered_entry = copy.deepcopy(entry)
+            details = maintenance_log_manipulation(tampered_entry)
             records = list(db.scalars(select(MaintenanceLogRecord).order_by(MaintenanceLogRecord.id)))
             verified = self.integrity_checker.verify_log_chain(
                 [
@@ -354,10 +355,22 @@ class SecureEVService:
                         "record_hash": record.record_hash,
                     }
                     for record in records
-                ]
+                ]  # The persisted record must remain unchanged.
             )
+            candidate_records = [
+                {
+                    "entry_id": record.entry_id,
+                    "recorded_at": record.recorded_at,
+                    "data": record.data,
+                    "previous_hash": record.previous_hash,
+                    "record_hash": record.record_hash,
+                }
+                for record in records
+            ]
+            candidate_records[-1] = tampered_entry
+            tampered_chain_valid = self.integrity_checker.verify_log_chain(candidate_records)
 
-        detected = not verified
+        detected = verified and not tampered_chain_valid
         event = {
             "type": "integrity_finding",
             "event_type": "maintenance_log_integrity",
@@ -368,6 +381,8 @@ class SecureEVService:
             "reason": "Maintenance log hash chain verification failed." if detected else "Maintenance log chain verified.",
             "timestamp": time.time(),
             **details,
+            "record_preserved": True,
+            "tampered_chain_valid": tampered_chain_valid,
         }
         self.handle_runtime_event(event)
         result = {
@@ -475,16 +490,30 @@ class SecureEVService:
 
     def evaluation(self) -> dict[str, Any]:
         with SessionLocal() as db:
-            attacks = db.scalar(select(func.count()).select_from(AttackRecord)) or 0
-            defended_attacks = db.scalar(
-                select(func.count()).select_from(AttackRecord).where(AttackRecord.status == "defended")
-            ) or 0
+            attack_rows = list(db.scalars(select(AttackRecord)))
+            supported_rows = [
+                row for row in attack_rows
+                if row.name in SUPPORTED_ATTACK_NAMES
+            ]
+            attack_counts = {
+                name: sum(1 for row in supported_rows if row.name == name)
+                for name in SUPPORTED_ATTACK_NAMES
+            }
+            supported_detections = sum(
+                1 for row in supported_rows
+                if bool((row.details or {}).get("detected"))
+            )
+            supported_attack_types = SUPPORTED_ATTACK_NAMES | {"control_injection"}
             telemetry = db.scalar(select(func.count()).select_from(TelemetryRecord)) or 0
             security = db.scalar(select(func.count()).select_from(SecurityEventRecord)) or 0
             responses = db.scalar(select(func.count()).select_from(ResponseRecord)) or 0
             executed_responses = db.scalar(
                 select(func.count()).select_from(ResponseRecord).where(ResponseRecord.executed.is_(True))
             ) or 0
+            supported_response_rows = [
+                row for row in db.scalars(select(ResponseRecord))
+                if row.attack_type in supported_attack_types
+            ]
             recovered = db.scalar(select(func.count()).select_from(RecoveryRecord)) or 0
             maintenance = list(
                 db.scalars(select(MaintenanceLogRecord).order_by(MaintenanceLogRecord.id))
@@ -509,8 +538,17 @@ class SecureEVService:
 
         return {
             "generated_at": time.time(),
-            "attacks_launched": attacks,
-            "attacks_defended": defended_attacks,
+            "attacks_launched": len(attack_rows),
+            "attacks_defended": None,
+            "supported_attacks": len(supported_rows),
+            "attack_counts": attack_counts,
+            "supported_detections": supported_detections,
+            "supported_responses_executed": sum(
+                1 for row in supported_response_rows if row.executed
+            ),
+            "supported_responses_failed": sum(
+                1 for row in supported_response_rows if not row.executed
+            ),
             "telemetry_records": telemetry,
             "security_events": security,
             "responses_recorded": responses,
@@ -754,10 +792,14 @@ def report_evaluation() -> dict[str, Any]:
 
 @app.get("/reports/export.json")
 def report_export() -> JSONResponse:
+    attacks = [
+        attack for attack in service.attack_history[-200:]
+        if attack.get("name") in SUPPORTED_ATTACK_NAMES
+    ]
     payload = {
         "report": service.evaluation(),
         "summary": {"runtime": service.runtime.get_runtime_status(), "risk": service._risk_status()},
-        "attacks": service.attack_history[-200:],
+        "attacks": attacks,
         "responses": service.response_history[-200:],
         "security_events": service.security_events[-200:],
         "recovery": service.recovery_history[-100:],
@@ -777,13 +819,12 @@ def report_export_csv() -> Response:
         "severity",
         "status",
         "reason",
-        "protected_outcome",
-        "without_defense_counterfactual",
+        "detection",
+        "response",
     ])
     for attack in service.attack_history[-200:]:
-        comparison = attack.get("comparison") or {}
-        protected = comparison.get("protected") or {}
-        unprotected = comparison.get("without_defense") or {}
+        if attack.get("name") not in SUPPORTED_ATTACK_NAMES:
+            continue
         writer.writerow([
             attack.get("timestamp") or attack.get("recorded_at"),
             "ATTACK",
@@ -791,9 +832,9 @@ def report_export_csv() -> Response:
             attack.get("target_ecu") or attack.get("ecu"),
             "",
             attack.get("status"),
-            protected.get("evidence") or attack.get("description", ""),
-            protected.get("status", "NOT_CAPTURED"),
-            unprotected.get("expected_effect", "Not available for this historical run."),
+            attack.get("reason") or attack.get("description", ""),
+            "DETECTED" if attack.get("detected") is True else "NOT DETECTED" if attack.get("detected") is False else "UNKNOWN",
+            attack.get("response_status", "UNKNOWN"),
         ])
     for response in service.response_history[-200:]:
         writer.writerow([response.get("timestamp") or response.get("recorded_at"), "RESPONSE", response.get("action"), response.get("ecu"), response.get("severity"), "EXECUTED" if response.get("executed") else "FAILED", response.get("reason", ""), "", ""])

@@ -157,19 +157,32 @@ class CarlaBridge:
         )
         return self.get_autonomy_status()
 
+    def set_patrol_target_speed(self, target_speed_kmh: float) -> None:
+        """Adjust the active Traffic Manager target without taking ownership."""
+        if self.vehicle is None:
+            raise RuntimeError("No vehicle spawned yet.")
+        if not self.autopilot_enabled or self.traffic_manager is None:
+            raise RuntimeError("Traffic Manager patrol is not active.")
+        target_speed_kmh = max(5.0, min(60.0, float(target_speed_kmh)))
+        self.traffic_manager.set_desired_speed(self.vehicle, target_speed_kmh)
+        self.patrol_speed_kmh = target_speed_kmh
+
     def stop_autonomous_patrol(self) -> None:
         self.set_autopilot(False)
 
     def emergency_stop(self) -> None:
-        """Immediately leave autopilot and apply a full brake to the EV."""
+        """Leave autopilot and request a controlled full brake.
+
+        CARLA's physics engine must decelerate the vehicle.  Overwriting
+        velocity here creates discontinuities that can launch or destabilize
+        the vehicle, especially when called while Traffic Manager is active.
+        """
         if self.vehicle is None:
             return
         self.set_autopilot(False)
         self.vehicle.apply_control(
             carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
         )
-        self.vehicle.set_target_velocity(carla.Vector3D())
-        self.vehicle.set_target_angular_velocity(carla.Vector3D())
 
     def get_autonomy_status(self) -> dict:
         next_action = None

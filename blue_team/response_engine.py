@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 import time
 from threading import RLock
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 @dataclass(frozen=True)
@@ -44,14 +44,20 @@ class ResponseAction:
 class ResponseEngine:
     """Select and execute proportional responses to confirmed attacks."""
 
-    def __init__(self, vcu: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        vcu: Optional[Any] = None,
+        emergency_brake_handler: Callable[[], bool] | None = None,
+    ) -> None:
         self.vcu = vcu
+        self.emergency_brake_handler = emergency_brake_handler
         self._lock = RLock()
         self.actions: list[ResponseAction] = []
         self.isolated_ecus: set[str] = set()
         self.untrusted_ecus: set[str] = set()
         self.emergency_brake_count = 0
         self.last_action: ResponseAction | None = None
+        self._handled_finding_keys: set[tuple[str, str, str, str]] = set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -67,6 +73,13 @@ class ResponseEngine:
         attack_type = str(getattr(finding, "attack_type", "unknown"))
         severity = str(getattr(finding, "severity", "INFO")).upper()
         reason = str(getattr(finding, "reason", "security finding"))
+        message_id = str(getattr(finding, "message_id", "") or "")
+        finding_key = (message_id, ecu, attack_type, reason)
+
+        with self._lock:
+            if finding_key in self._handled_finding_keys:
+                return []
+            self._handled_finding_keys.add(finding_key)
 
         if not detected:
             return [self._record("monitor", ecu, attack_type, severity, reason, True)]
@@ -124,6 +137,7 @@ class ResponseEngine:
             self.untrusted_ecus.clear()
             self.emergency_brake_count = 0
             self.last_action = None
+            self._handled_finding_keys.clear()
 
     # ------------------------------------------------------------------
     # Action implementations
@@ -142,14 +156,18 @@ class ResponseEngine:
 
     def _emergency_brake(self, ecu: str, attack_type: str, severity: str, reason: str) -> ResponseAction:
         executed = False
-        if self.vcu is not None:
-            try:
+        handler = self.emergency_brake_handler
+        try:
+            if handler is not None:
+                executed = bool(handler())
+            elif self.vcu is not None:
                 self.vcu.emergency_brake()
                 executed = True
+            if executed:
                 with self._lock:
                     self.emergency_brake_count += 1
-            except Exception as exc:  # response layer must not crash the vehicle loop
-                reason = f"{reason}; emergency brake execution failed: {exc}"
+        except Exception as exc:  # response layer must not crash the vehicle loop
+            reason = f"{reason}; emergency brake execution failed: {exc}"
 
         return self._record("emergency_brake", ecu.upper(), attack_type, severity, reason, executed)
 
