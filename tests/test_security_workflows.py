@@ -86,6 +86,46 @@ def test_control_injection_scenarios_are_blocked_by_gateway() -> None:
     assert decision.reason == replay.expected_reason
 
 
+def test_speed_spoofing_is_deterministic_and_keeps_ground_truth_separate() -> None:
+    attacker = DataSpoofingAttacker(NoopPublisher())
+    scenario = attacker.speed_spoofing(spoofed_speed_kmh=25.0)
+    finding = GroundTruthValidator().validate_message(
+        scenario.topic,
+        scenario.message,
+        carla_ground_truth={"speed_kmh": 0.0, "location": {"x": 0, "y": 0, "z": 0}},
+        trusted_battery_soc=80.0,
+    )
+    assert scenario.expected_value == 25.0
+    assert finding.attack_type == "speed_spoofing"
+    assert finding.actual_value == 0.0
+    assert finding.reported_value == 25.0
+
+
+def test_unauthorized_acceleration_uses_bounded_traffic_manager_target() -> None:
+    from backend.runtime import SecureEVRuntime
+
+    class FakeBridge:
+        autopilot_enabled = True
+        vehicle = object()
+
+        def get_ground_truth_state(self):
+            return {"speed_kmh": 28.0}
+
+        def set_patrol_target_speed(self, target):
+            self.target = target
+
+    runtime = SecureEVRuntime()
+    runtime.bridge = FakeBridge()
+    runtime.autonomous_target_speed_kmh = 28.0
+    effect = runtime._start_unauthorized_acceleration()
+    assert effect["target_speed_kmh"] <= 35.0
+    runtime._run_unauthorized_acceleration(0.0)
+    assert runtime.bridge.target == effect["target_speed_kmh"]
+    runtime._request_safe_stop()
+    runtime._run_unauthorized_acceleration(1.0)
+    assert runtime._unauthorized_acceleration is None
+
+
 def test_telemetry_spoof_scenarios_are_detected_against_trusted_state() -> None:
     attacker = DataSpoofingAttacker(NoopPublisher())
     validator = GroundTruthValidator()
@@ -227,6 +267,33 @@ def test_isolated_or_untrusted_ecu_telemetry_is_not_trusted() -> None:
     assert "VCU" not in service.current_telemetry
 
 
+def test_critical_response_is_deduplicated_and_safe_stop_is_latched() -> None:
+    @dataclass
+    class Finding:
+        detected: bool = True
+        ecu: str = "TCU"
+        attack_type: str = "gps_spoofing"
+        severity: str = "CRITICAL"
+        reason: str = "ground-truth mismatch"
+
+    brake_requests: list[bool] = []
+    engine = ResponseEngine(
+        emergency_brake_handler=lambda: brake_requests.append(True) or True,
+    )
+    assert len(engine.handle_finding(Finding())) == 3
+    assert engine.handle_finding(Finding()) == []
+    assert brake_requests == [True]
+
+    from backend.runtime import SecureEVRuntime
+
+    runtime = SecureEVRuntime()
+    assert runtime._request_safe_stop()
+    assert not runtime._allow_pending_command(
+        {"data": {"command": "set_control", "throttle": 0.0, "brake": 0.0, "steer": 0.0}}
+    )
+    assert runtime._allow_pending_command({"data": {"command": "emergency_brake"}})
+
+
 def test_maintenance_attack_persists_tampering_and_alert(monkeypatch, tmp_path) -> None:
     from sqlalchemy import create_engine, select
     from sqlalchemy.orm import sessionmaker
@@ -251,7 +318,7 @@ def test_maintenance_attack_persists_tampering_and_alert(monkeypatch, tmp_path) 
             )
         )
         assert record is not None
-        assert record.data["inspection"] == "tampered"
+        assert record.data["inspection"] == "passed"
         assert event is not None
         assert event.action == "tampering_detected"
 

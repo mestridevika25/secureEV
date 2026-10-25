@@ -113,7 +113,8 @@ a { text-decoration: none; }
 .attack-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; }
 .attack-card { border: 1px solid #1d3148; border-radius: 11px; background: #0a1624; padding: 12px; }
 .attack-name { font-size: 12px; font-weight: 750; }
-.attack-target { color: #71859c; font-size: 10px; margin: 5px 0 11px; }
+.attack-target { color: #71859c; font-size: 10px; margin: 5px 0 8px; }
+.attack-description { color: #9aacc0; font-size: 11px; line-height: 1.45; min-height: 48px; margin-bottom: 11px; }
 .detail-card { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; border: 1px solid #1d3148; border-radius: 11px; padding: 12px; background: #0a1624; }
 .position-card { grid-template-columns: repeat(2,1fr); }
 .report-grid { margin-top: 6px; }

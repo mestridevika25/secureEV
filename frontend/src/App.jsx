@@ -4,17 +4,41 @@ import { AlertRow, EcuGrid, HistoryTable, MetricCard, Sparkline, StatusDot } fro
 
 const HISTORY_LIMIT = 50;
 const ATTACKS = [
-  { name: 'gps_spoofing', label: 'GPS Spoofing', target: 'TCU', kind: 'Telemetry' },
-  { name: 'speed_spoofing', label: 'Speed Spoofing', target: 'VCU', kind: 'Telemetry' },
-  { name: 'battery_soc_spoofing', label: 'Battery SOC Spoofing', target: 'BMS', kind: 'Telemetry' },
-  { name: 'unauthorized_acceleration', label: 'Unauthorized Acceleration', target: 'VCU', kind: 'Control' },
-  { name: 'out_of_range_control', label: 'Out-of-Range Control', target: 'VCU', kind: 'Control' },
-  { name: 'unauthorized_command', label: 'Unauthorized Command', target: 'VCU', kind: 'Control' },
-  { name: 'replay_control', label: 'Replay Control', target: 'VCU', kind: 'Control' },
-  { name: 'cloud_update_attack', label: 'Tampered Cloud Update', target: 'OTA', kind: 'Firmware' },
-  { name: 'ecu_update_attack', label: 'Forged ECU Update', target: 'OTA', kind: 'Firmware' },
-  { name: 'maintenance_log_manipulation', label: 'Maintenance Log Tampering', target: 'DB', kind: 'Integrity', requiresRuntime: false },
+  { name: 'gps_spoofing', label: 'GPS Spoofing', target: 'TCU', kind: 'Telemetry', description: 'Inject false GPS telemetry and compare the reported position against CARLA ground truth.' },
+  { name: 'battery_soc_spoofing', label: 'Battery SOC Spoofing', target: 'BMS', kind: 'Telemetry', description: 'Inject false battery state-of-charge telemetry and compare it against the trusted Digital Twin value.' },
+  { name: 'unauthorized_acceleration', label: 'Unauthorized Acceleration', target: 'VCU', kind: 'Control', description: 'Simulate an unauthorized acceleration command and display its actual execution, detection, and response outcome.' },
 ];
+
+const SUPPORTED_ATTACKS = new Set(ATTACKS.map((attack) => attack.name));
+
+function attackLabel(name) {
+  return String(name || 'Unknown attack').replaceAll('_', ' ');
+}
+
+function attackObservedEffect(attack) {
+  const details = attack?.details || attack || {};
+  return details.observed_effect || details.attack_effect || details.description || 'Unknown';
+}
+
+function attackDetection(attack) {
+  if (typeof attack?.detected === 'boolean') return attack.detected ? 'DETECTED' : 'NOT DETECTED';
+  if (typeof attack?.details?.detected === 'boolean') return attack.details.detected ? 'DETECTED' : 'NOT DETECTED';
+  return 'Unknown';
+}
+
+function attackResponse(attack) {
+  const details = attack?.details || attack || {};
+  if (details.response_status) return details.response_status;
+  if (details.response_executed === true) return 'RESPONSE EXECUTED';
+  if (details.response_executed === false) return 'RESPONSE FAILED';
+  return 'Unknown';
+}
+
+function supportedAttacks(attacks) {
+  return (Array.isArray(attacks) ? attacks : [])
+    .filter((attack) => SUPPORTED_ATTACKS.has(attack.name))
+    .sort((a, b) => new Date(b.recorded_at || b.timestamp || 0) - new Date(a.recorded_at || a.timestamp || 0));
+}
 
 const emptySnapshot = {
   runtime: { running: false, ecu_status: {}, control_bridge: {}, response: {}, integrity: { firmware_signature_configured: false, untrusted_ecus: [] }, camera: {}, autonomy: { enabled: false, mode: 'MANUAL', target_speed_kmh: 28, next_maneuver: null } },
@@ -113,7 +137,7 @@ export default function App() {
   const ecuStatus = snapshot.ecus || {};
   const isRunning = Boolean(snapshot.runtime?.running);
   const onlineCount = useMemo(() => Object.values(ecuStatus).filter((status) => status === 'ONLINE').length, [ecuStatus]);
-  const latestAttack = snapshot.attacks?.[snapshot.attacks.length - 1];
+  const latestAttack = supportedAttacks(snapshot.attacks).at(0);
   const latestResponse = snapshot.responses?.[snapshot.responses.length - 1];
   const latestRecovery = snapshot.recovery?.[snapshot.recovery.length - 1];
   const cameraAttached = Boolean(snapshot.runtime?.camera?.attached);
@@ -125,7 +149,7 @@ export default function App() {
     setBusy(true);
     try {
       const result = await fn();
-      setMessage(result?.defended ? 'Attack detected and rejected by the defense.' : successMessage);
+      setMessage(result?.error ? `Request failed: ${result.error}` : successMessage);
       const fresh = await api.getSnapshot();
       setSnapshot(fresh);
       if (refreshCamera) setCameraNonce(Date.now());
@@ -147,7 +171,7 @@ export default function App() {
   };
 
   const launchAttack = (name) => action(() => api.launchAttack(name), `${name.replaceAll('_', ' ')} published.`);
-  const sendControl = () => action(() => api.vehicleControl(control), 'VCU command sent through protected MQTT path.');
+  const sendControl = () => action(() => api.vehicleControl(control), 'VCU command sent through MQTT.');
   const neutral = () => action(() => api.vehicleControl({ throttle: 0, brake: 0, steer: 0 }), 'Vehicle control set to neutral.');
   const startPatrol = () => action(() => api.startAutonomous(patrolSpeed), `Autonomous patrol started at ${patrolSpeed} km/h.`);
   const stopPatrol = () => action(() => api.stopAutonomous(), 'Switched to manual mode.');
@@ -187,7 +211,12 @@ export default function App() {
         {activeView === 'overview' ? (
           <>
             <section className="metric-grid">
-              <MetricCard label="Speed" value={Number(vehicle.speed_kmh || 0).toFixed(1)} unit="km/h" meta={`Acceleration ${Number(vehicle.acceleration_mps2 || 0).toFixed(2)} m/s²`} />
+              <MetricCard
+                label="Speed"
+                value={Number(vehicle.trusted_speed_kmh ?? vehicle.speed_kmh ?? 0).toFixed(1)}
+                unit="km/h"
+                meta={`Reported ${Number(vehicle.reported_speed_kmh ?? vehicle.speed_kmh ?? 0).toFixed(1)} · Acceleration ${Number(vehicle.acceleration_mps2 || 0).toFixed(2)} m/s²`}
+              />
               <MetricCard label="Battery" value={Number(vehicle.battery_soc || 0).toFixed(1)} unit="%" meta={`Temp ${Number(vehicle.battery_temp || 0).toFixed(1)} °C`} />
               <MetricCard label="Motor" value={Math.round(vehicle.motor_rpm || 0).toLocaleString()} unit="RPM" meta={`Temp ${Number(vehicle.motor_temp || 0).toFixed(1)} °C`} />
               <MetricCard label="GPS" value={vehicle.reported_gps?.source || '—'} meta={`${Number(vehicle.reported_gps?.x || 0).toFixed(2)}, ${Number(vehicle.reported_gps?.y || 0).toFixed(2)}`} />
@@ -259,7 +288,7 @@ export default function App() {
               </div>
 
               <div className="panel">
-                <div className="panel-header"><div><h2>Runtime & control</h2><p>Application and protected VCU controls</p></div></div>
+                <div className="panel-header"><div><h2>Runtime & control</h2><p>Application and VCU controls</p></div></div>
                 <div className="control-buttons">
                   {!isRunning ? <button className="btn primary" disabled={busy} onClick={() => action(api.startRuntime, 'SecureEV runtime started.', true)}>Start SecureEV</button> : <button className="btn secondary" disabled={busy} onClick={() => action(api.stopRuntime, 'SecureEV runtime stopped.', true)}>Stop SecureEV</button>}
                   <button className="btn danger" disabled={busy || !isRunning} onClick={() => action(api.emergencyBrake, 'Emergency brake command sent.')}>Emergency Brake</button>
@@ -301,21 +330,20 @@ export default function App() {
           <section className="security-view">
             <div className="panel">
               <div className="panel-header"><div><h2>Red Team attack console</h2><p>Controlled attacks against the isolated SecureEV simulation</p></div></div>
-              <div className="comparison-notice">
-                Run a scenario here to record its protected result. The Reports tab pairs that observed result with a clearly labeled no-defense counterfactual; the live vehicle defenses are never switched off.
-              </div>
+              <div className="comparison-notice">Run one of the three supported demonstrations. Results below reflect the recorded execution, detection, and response independently.</div>
               <div className="attack-grid">
                 {ATTACKS.map((attack) => (
                   <div className="attack-card" key={attack.name}>
                     <div className="attack-name">{attack.label}</div>
                     <div className="attack-target">{attack.kind} · Target ECU: {attack.target}</div>
-                    <button className="btn danger full" disabled={busy || (attack.requiresRuntime !== false && !isRunning)} onClick={() => launchAttack(attack.name)}>Run scenario</button>
+                    <div className="attack-description">{attack.description}</div>
+                    <button className="btn danger full" disabled={busy || !isRunning} onClick={() => launchAttack(attack.name)}>{busy ? 'Running…' : 'Run Attack'}</button>
                   </div>
                 ))}
               </div>
             </div>
             <div className="two-column">
-              <div className="panel"><div className="panel-header"><div><h2>Latest attack</h2><p>Most recently requested scenario</p></div></div>{latestAttack ? <div className="detail-card"><div><span>Name</span><strong>{String(latestAttack.name).replaceAll('_', ' ')}</strong></div><div><span>ECU</span><strong>{latestAttack.ecu || latestAttack.target_ecu}</strong></div><div><span>Result</span><strong>{latestAttack.defended ? 'DEFENDED' : latestAttack.published ? latestAttack.outcome_status === 'unconfirmed' ? 'UNCONFIRMED' : 'PUBLISHED' : 'FAILED'}</strong></div></div> : <div className="empty-state">No attacks recorded.</div>}</div>
+            <div className="panel"><div className="panel-header"><div><h2>Latest attack</h2><p>Most recently requested supported scenario</p></div></div>{latestAttack ? <div className="detail-card"><div><span>Attack</span><strong>{attackLabel(latestAttack.name)}</strong></div><div><span>Target</span><strong>{latestAttack.ecu || latestAttack.target_ecu || 'Unknown'}</strong></div><div><span>Execution</span><strong>{latestAttack.published ? 'ATTACK EXECUTED' : 'RESPONSE FAILED'}</strong></div><div><span>Detection</span><strong>{attackDetection(latestAttack)}</strong></div><div><span>Observed effect</span><strong>{attackObservedEffect(latestAttack)}</strong></div></div> : <div className="empty-state">No supported attacks recorded.</div>}</div>
               <div className="panel"><div className="panel-header"><div><h2>Latest response</h2><p>Defensive action from the response engine</p></div></div>{latestResponse ? <div className="detail-card"><div><span>Action</span><strong>{latestResponse.action}</strong></div><div><span>ECU</span><strong>{latestResponse.ecu}</strong></div><div><span>Severity</span><strong>{latestResponse.severity}</strong></div></div> : <div className="empty-state">No response recorded.</div>}</div>
             </div>
             <div className="panel"><div className="panel-header"><div><h2>Security event stream</h2><p>Current and persisted security events</p></div></div><div className="alert-list">{snapshot.security?.recent_events?.length ? snapshot.security.recent_events.slice().reverse().map((a, i) => <AlertRow key={`${a.id || a.timestamp}-${i}`} alert={a} />) : <div className="empty-state">No security events.</div>}</div></div>
@@ -324,7 +352,7 @@ export default function App() {
 
         {activeView === 'history' ? (
           <section className="history-view">
-            <div className="panel"><div className="panel-header"><div><h2>Attack, response and recovery history</h2><p>Persisted records from SQLite</p></div></div><HistoryTable attacks={history.attacks} responses={history.responses} recoveries={history.recoveries} /></div>
+            <div className="panel"><div className="panel-header"><div><h2>Recent supported attacks</h2><p>Newest executions first</p></div></div><HistoryTable attacks={history.attacks} /></div>
           </section>
         ) : null}
 
@@ -334,15 +362,14 @@ export default function App() {
               <div className="panel-header"><div><h2>Security report</h2><p>Operational project metrics from the local SecureEV database</p></div></div>
               {evaluation ? (
                 <div className="report-grid">
-                  <MetricCard label="Attacks launched" value={evaluation.attacks_launched} />
-                  <MetricCard label="Attacks defended" value={evaluation.attacks_defended} />
-                  <MetricCard label="Telemetry records" value={evaluation.telemetry_records} />
-                  <MetricCard label="Security events" value={evaluation.security_events} />
-                  <MetricCard label="Response actions" value={evaluation.responses_recorded} />
-                  <MetricCard label="Executed responses" value={evaluation.responses_executed} />
-                  <MetricCard label="Recovery events" value={evaluation.recovery_events} />
-                  <MetricCard label="Firmware key" value={evaluation.firmware_signature_configured ? 'Configured' : 'Not configured'} />
-                  <MetricCard label="Maintenance log chain" value={evaluation.maintenance_log_chain_valid === null ? 'Not checked' : evaluation.maintenance_log_chain_valid ? 'Valid' : 'TAMPERED'} />
+                  <MetricCard label="Supported attacks" value={evaluation.supported_attacks} />
+                  <MetricCard label="GPS executions" value={evaluation.attack_counts?.gps_spoofing || 0} />
+                  <MetricCard label="Battery SOC executions" value={evaluation.attack_counts?.battery_soc_spoofing || 0} />
+                  <MetricCard label="Unauthorized acceleration" value={evaluation.attack_counts?.unauthorized_acceleration || 0} />
+                  <MetricCard label="Confirmed detections" value={evaluation.supported_detections} />
+                  <MetricCard label="Responses executed" value={evaluation.supported_responses_executed} />
+                  <MetricCard label="Responses failed" value={evaluation.supported_responses_failed} />
+                  <MetricCard label="Recoveries" value={evaluation.recovery_events} />
                 </div>
               ) : <div className="empty-state">Loading evaluation…</div>}
               <div className="export-row">
@@ -351,35 +378,7 @@ export default function App() {
               </div>
               <div className="report-note">{evaluation?.note || 'Metrics are calculated from recorded project events.'}</div>
             </div>
-            <div className="panel">
-              <div className="panel-header"><div><h2>Attack vs defense comparison</h2><p>Observed protected run compared with the expected impact if its defense were absent</p></div></div>
-              <div className="comparison-notice">
-                “Protected” is the result actually returned by the running simulation. “Without defense” is a scenario-based counterfactual, not a second live attack; defenses stay enabled and no unsafe command is sent to CARLA.
-              </div>
-              {history.attacks.length ? (
-                <div className="table-wrap">
-                  <table className="comparison-table">
-                    <thead><tr><th>Scenario</th><th>Protected run · observed</th><th>Evidence</th><th>Without defense · counterfactual</th></tr></thead>
-                    <tbody>
-                      {history.attacks.slice().reverse().map((attack, index) => {
-                        const comparison = attack.comparison;
-                        const protectedRun = comparison?.protected;
-                        const noDefense = comparison?.without_defense;
-                        return (
-                          <tr key={`${attack.id || attack.timestamp || attack.name}-${index}`}>
-                            <td>{String(attack.name || 'Attack').replaceAll('_', ' ')}</td>
-                            <td><span className={`pill ${protectedRun?.defended ? 'pill-ok' : 'pill-warn'}`}>{protectedRun?.status || (attack.defended ? 'BLOCKED_OR_MITIGATED' : 'NOT_CAPTURED')}</span></td>
-                            <td>{protectedRun?.evidence || attack.defense_reason || attack.reason || 'No defense evidence saved for this historical run.'}</td>
-                            <td>{noDefense?.expected_effect || 'Counterfactual was not recorded for this historical run.'}</td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              ) : <div className="empty-state">No attacks recorded yet. Run a scenario from the Security tab to generate a comparison.</div>}
-              <div className="report-note">Find direct defense evidence in Security → Latest attack, Latest response, and Security event stream. Older attack records created before this comparison feature may not include a saved comparison.</div>
-            </div>
+            <div className="panel"><div className="panel-header"><div><h2>Recent outcomes</h2><p>Attack execution, detection, and response are separate facts.</p></div></div><HistoryTable attacks={history.attacks} /></div>
             <div className="panel"><div className="panel-header"><div><h2>Latest recovery</h2><p>Safe-state restoration status</p></div></div>{latestRecovery ? <div className="detail-card"><div><span>Status</span><strong>{latestRecovery.status}</strong></div><div><span>Vehicle</span><strong>{latestRecovery.vehicle_id}</strong></div><div><span>Restored</span><strong>{latestRecovery.restored_ecus?.length || 0} ECUs</strong></div></div> : <div className="empty-state">No recovery event recorded yet.</div>}</div>
           </section>
         ) : null}

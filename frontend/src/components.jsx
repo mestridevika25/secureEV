@@ -73,27 +73,52 @@ export function AlertRow({ alert }) {
   );
 }
 
-export function HistoryTable({ attacks = [], responses = [], recoveries = [] }) {
-  const items = [
-    ...attacks.map((a) => ({ time: a.recorded_at, kind: 'ATTACK', name: a.name, ecu: a.target_ecu, status: a.status })),
-    ...responses.map((r) => ({ time: r.recorded_at, kind: 'RESPONSE', name: r.action, ecu: r.ecu, status: r.executed ? 'EXECUTED' : 'FAILED' })),
-    ...recoveries.map((r) => ({ time: r.recorded_at, kind: 'RECOVERY', name: 'safe baseline restore', ecu: r.vehicle_id, status: r.status })),
-  ].sort((a, b) => new Date(b.time) - new Date(a.time)).slice(0, 20);
+const SUPPORTED_ATTACKS = new Set(['gps_spoofing', 'battery_soc_spoofing', 'unauthorized_acceleration']);
+
+function label(value) {
+  return String(value || 'Unknown').replaceAll('_', ' ');
+}
+
+function detection(attack) {
+  if (typeof attack.detected === 'boolean') return attack.detected ? 'DETECTED' : 'NOT DETECTED';
+  if (typeof attack.details?.detected === 'boolean') return attack.details.detected ? 'DETECTED' : 'NOT DETECTED';
+  return 'Unknown';
+}
+
+function response(attack) {
+  const details = attack.details || attack;
+  if (details.response_status) return details.response_status;
+  if (details.response_executed === true) return 'RESPONSE EXECUTED';
+  if (details.response_executed === false) return 'RESPONSE FAILED';
+  return 'Unknown';
+}
+
+function effect(attack) {
+  const details = attack.details || attack;
+  return details.observed_effect || details.attack_effect || details.description || 'Unknown';
+}
+
+export function HistoryTable({ attacks = [] }) {
+  const items = attacks
+    .filter((attack) => SUPPORTED_ATTACKS.has(attack.name))
+    .sort((a, b) => new Date(b.recorded_at || b.timestamp || 0) - new Date(a.recorded_at || a.timestamp || 0))
+    .slice(0, 20);
 
   if (!items.length) return <div className="empty-state">No security history recorded yet.</div>;
 
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Time</th><th>Type</th><th>Event</th><th>Target</th><th>Status</th></tr></thead>
+        <thead><tr><th>Time</th><th>Attack</th><th>Target</th><th>Observed effect</th><th>Detection</th><th>Response</th></tr></thead>
         <tbody>
           {items.map((item, index) => (
-            <tr key={`${item.kind}-${item.time}-${index}`}>
-              <td>{formatDateTime(item.time)}</td>
-              <td><span className={`pill ${item.kind === 'ATTACK' ? 'pill-warn' : item.kind === 'RECOVERY' ? 'pill-info' : 'pill-ok'}`}>{item.kind}</span></td>
-              <td>{String(item.name).replaceAll('_', ' ')}</td>
-              <td>{item.ecu || '—'}</td>
-              <td>{item.status}</td>
+            <tr key={`${item.id || item.name}-${item.recorded_at || item.timestamp}-${index}`}>
+              <td>{formatDateTime(item.recorded_at || item.timestamp)}</td>
+              <td>{label(item.name)}</td>
+              <td>{item.target_ecu || item.ecu || 'Unknown'}</td>
+              <td>{effect(item)}</td>
+              <td>{detection(item)}</td>
+              <td>{response(item)}</td>
             </tr>
           ))}
         </tbody>

@@ -95,7 +95,11 @@ class MQTTControlBridge:
         # unexpected topic instead of silently ignoring it.
         return self.subscriber.subscribe(CONTROL_WILDCARD, qos=1)
 
-    def process_pending_commands(self, max_commands: int = 10) -> int:
+    def process_pending_commands(
+        self,
+        max_commands: int = 10,
+        command_filter: Any | None = None,
+    ) -> int:
         """Apply queued commands from the main simulation thread."""
 
         if max_commands <= 0:
@@ -110,6 +114,8 @@ class MQTTControlBridge:
                 break
 
             try:
+                if command_filter is not None and not command_filter(pending.message):
+                    continue
                 self._apply_command(pending.message)
             finally:
                 self._queue.task_done()
@@ -140,3 +146,15 @@ class MQTTControlBridge:
 
     def pending_count(self) -> int:
         return self._queue.qsize()
+
+    def clear_pending_commands(self) -> int:
+        """Discard commands received before a recovery boundary."""
+        cleared = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                return cleared
+            else:
+                self._queue.task_done()
+                cleared += 1

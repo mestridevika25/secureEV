@@ -68,6 +68,12 @@ VALIDATED_TELEMETRY_ECUS = {"VCU", "BMS", "TCU"}
 CAMERA_ENABLED_BY_DEFAULT = os.getenv("SECUREEV_ENABLE_CAMERA", "0").strip().lower() in {"1", "true", "yes", "on"}
 AUTONOMOUS_BY_DEFAULT = os.getenv("SECUREEV_AUTONOMOUS_DEFAULT", "1").strip().lower() in {"1", "true", "yes", "on"}
 AUTONOMOUS_TARGET_SPEED_KMH = float(os.getenv("SECUREEV_AUTONOMOUS_SPEED_KMH", "28"))
+UNAUTHORIZED_ACCELERATION_MAX_KMH = min(
+    35.0, max(5.0, float(os.getenv("SECUREEV_ATTACK_MAX_SPEED_KMH", "35")))
+)
+UNAUTHORIZED_ACCELERATION_DURATION_SECONDS = min(
+    3.0, max(0.5, float(os.getenv("SECUREEV_ATTACK_DURATION_SECONDS", "3")))
+)
 
 
 class SecureEVRuntime:
@@ -79,11 +85,17 @@ class SecureEVRuntime:
     ) -> None:
         self.event_callback = event_callback
         self._lock = threading.RLock()
+        self._carla_operation_lock = threading.RLock()
         self._attack_condition = threading.Condition()
         self._telemetry_outcomes: dict[str, dict[str, Any]] = {}
         self._control_outcomes: dict[str, dict[str, Any]] = {}
         self._stop_event = threading.Event()
         self._quarantine_reported: set[str] = set()
+        self._safe_stop_latched = False
+        self._reported_speed_kmh: float | None = None
+        self._speed_spoof_value: float | None = None
+        self._speed_spoof_until = 0.0
+        self._unauthorized_acceleration: dict[str, float] | None = None
         self._thread: threading.Thread | None = None
 
         self.running = False
@@ -135,6 +147,11 @@ class SecureEVRuntime:
             self.camera_enabled = CAMERA_ENABLED_BY_DEFAULT
             self._stop_event.clear()
             self._quarantine_reported.clear()
+            self._safe_stop_latched = False
+            self._reported_speed_kmh = None
+            self._speed_spoof_value = None
+            self._speed_spoof_until = 0.0
+            self._unauthorized_acceleration = None
 
         with self._attack_condition:
             self._telemetry_outcomes.clear()
@@ -191,7 +208,10 @@ class SecureEVRuntime:
                 expected_vehicle_id=VEHICLE_ID,
                 alert_handler=self._on_security_event,
             )
-            response_engine = ResponseEngine(vcu=vcu)
+            response_engine = ResponseEngine(
+                vcu=vcu,
+                emergency_brake_handler=self._request_safe_stop,
+            )
             runtime_response = RuntimeResponseCoordinator(response_engine)
 
             control_subscriber = MQTTSubscriber(
@@ -317,12 +337,21 @@ class SecureEVRuntime:
         if self.bridge is None or self.bridge.vehicle is None:
             raise RuntimeError("No active CARLA vehicle is available for recovery.")
 
-        self.bridge.reset_vehicle(spawn_index=spawn_index)
-        if self.autonomous_by_default and self.acu is not None:
-            self.acu.enable_autonomous_mode(self.autonomous_target_speed_kmh)
-            self.bridge.start_autonomous_patrol(self.autonomous_target_speed_kmh)
-        elif self.acu is not None:
-            self.acu.disable_autonomous_mode()
+        with self._carla_operation_lock:
+            self._safe_stop_latched = False
+            self._speed_spoof_value = None
+            self._speed_spoof_until = 0.0
+            self._unauthorized_acceleration = None
+            self.bridge.reset_vehicle(spawn_index=spawn_index)
+            if self.autonomous_by_default and self.acu is not None:
+                self.acu.enable_autonomous_mode(self.autonomous_target_speed_kmh)
+                self.bridge.start_autonomous_patrol(self.autonomous_target_speed_kmh)
+            elif self.acu is not None:
+                self.acu.disable_autonomous_mode()
+            if self.control_bridge is not None:
+                self.control_bridge.clear_pending_commands()
+            if self.security_gateway is not None:
+                self.security_gateway.reset()
         if self.camera is not None:
             try:
                 self.camera.set_live_source()
@@ -369,7 +398,14 @@ class SecureEVRuntime:
 
                 # Process newly-arrived commands on every high-rate loop so
                 # dashboard controls remain responsive.
-                self.control_bridge.process_pending_commands(max_commands=20)
+                self.control_bridge.process_pending_commands(
+                    max_commands=20,
+                    command_filter=self._allow_pending_command,
+                )
+                with self._carla_operation_lock:
+                    if self._safe_stop_latched and self.bridge is not None:
+                        self.bridge.emergency_stop()
+                    self._run_unauthorized_acceleration(now)
 
                 # Digital-twin ECU updates and MQTT telemetry remain at 10 Hz.
                 if now >= next_twin_tick:
@@ -383,6 +419,13 @@ class SecureEVRuntime:
                         if topic is None:
                             continue
                         try:
+                            if (
+                                ecu_id == "VCU"
+                                and self._speed_spoof_until > time.monotonic()
+                                and self._speed_spoof_value is not None
+                            ):
+                                data = dict(data)
+                                data["speed_kmh"] = self._speed_spoof_value
                             self.telemetry_bridge.publish_telemetry(
                                 ecu_id=ecu_id,
                                 topic=topic,
@@ -402,13 +445,14 @@ class SecureEVRuntime:
                 # The spectator camera is updated much more frequently than
                 # the ECU loop, and CarlaBridge applies frame-rate-independent
                 # damping to make the third-person view smooth.
-                if self.bridge is not None and self.bridge.vehicle is not None:
-                    self.bridge.follow_vehicle(
-                        distance=10.0,
-                        height=4.5,
-                        pitch=-16.0,
-                        smoothing=12.0,
-                    )
+                with self._carla_operation_lock:
+                    if self.bridge is not None and self.bridge.vehicle is not None:
+                        self.bridge.follow_vehicle(
+                            distance=10.0,
+                            height=4.5,
+                            pitch=-16.0,
+                            smoothing=12.0,
+                        )
 
                 self.last_loop_time = time.time()
             except Exception as exc:
@@ -477,6 +521,8 @@ class SecureEVRuntime:
                         self._telemetry_outcomes.pop(next(iter(self._telemetry_outcomes)))
                     self._attack_condition.notify_all()
             trusted = not finding.detected
+            if ecu == "VCU" and "speed_kmh" in (payload.get("data") or {}):
+                self._reported_speed_kmh = float(payload["data"]["speed_kmh"])
             self._emit(
                 {
                     "type": "telemetry_finding",
@@ -537,7 +583,7 @@ class SecureEVRuntime:
                             "reason": action.reason,
                         }
                     )
-            if trusted:
+            if trusted or finding.detected:
                 self._emit({"type": "telemetry", "topic": topic, "payload": payload, "timestamp": time.time()})
         except Exception as exc:
             self._emit(
@@ -575,17 +621,21 @@ class SecureEVRuntime:
             }
         )
 
-        # A blocked malicious VCU command is itself a security event. During
-        # autonomous patrol, fail closed and stop the EV so the attack has a
-        # visible, physical consequence in the simulator.
-        if getattr(event, "action", None) == "BLOCK" and self.response_engine is not None:
+        # A forged vehicle identity requesting acceleration warrants a
+        # controlled safe stop. Other rejected commands never reached the
+        # VCU and must not disturb otherwise healthy vehicle motion.
+        if (
+            getattr(event, "action", None) == "BLOCK"
+            and getattr(event, "reason", None) == "unexpected vehicle_id"
+            and self.response_engine is not None
+        ):
             action = self.response_engine.emergency_brake(
                 ecu=str(getattr(event, "ecu", None) or "VCU"),
                 attack_type="control_injection",
                 severity="HIGH",
                 reason=str(getattr(event, "reason", "blocked malicious control command")),
             )
-            self._enter_safe_stop()
+            self._request_safe_stop()
             self._emit(
                 {
                     "type": "response_action",
@@ -597,6 +647,20 @@ class SecureEVRuntime:
                     "severity": action.severity,
                     "executed": action.executed,
                     "reason": action.reason,
+                }
+            )
+        elif getattr(event, "action", None) == "BLOCK":
+            self._emit(
+                {
+                    "type": "response_action",
+                    "event_type": "response",
+                    "timestamp": time.time(),
+                    "action": "command_rejected",
+                    "ecu": str(getattr(event, "ecu", None) or "VCU"),
+                    "attack_type": "control_injection",
+                    "severity": "HIGH",
+                    "executed": True,
+                    "reason": str(getattr(event, "reason", "command rejected")),
                 }
             )
 
@@ -614,6 +678,12 @@ class SecureEVRuntime:
             return {}
         return {
             "speed_kmh": state.speed_kmh,
+            "trusted_speed_kmh": state.speed_kmh,
+            "reported_speed_kmh": (
+                self._reported_speed_kmh
+                if self._reported_speed_kmh is not None
+                else state.speed_kmh
+            ),
             "acceleration_mps2": state.acceleration,
             "battery_soc": state.battery_soc,
             "battery_temp": state.battery_temp,
@@ -728,25 +798,31 @@ class SecureEVRuntime:
         *,
         replan: bool = True,
     ) -> dict[str, Any]:
+        if self._safe_stop_latched:
+            raise RuntimeError("Vehicle is in an emergency safe stop; recover before resuming.")
         if not self.running or self.bridge is None or self.bridge.vehicle is None or self.acu is None:
             raise RuntimeError("Start the SecureEV runtime before enabling autonomous mode.")
         speed = self.autonomous_target_speed_kmh if target_speed_kmh is None else max(5.0, min(60.0, float(target_speed_kmh)))
         self.autonomous_target_speed_kmh = speed
-        self.acu.enable_autonomous_mode(speed)
-        if replan or not self.bridge.autopilot_enabled:
-            return self.bridge.start_autonomous_patrol(speed)
-        return self.bridge.get_autonomy_status()
+        with self._carla_operation_lock:
+            self.acu.enable_autonomous_mode(speed)
+            if replan or not self.bridge.autopilot_enabled:
+                return self.bridge.start_autonomous_patrol(speed)
+            return self.bridge.get_autonomy_status()
 
     def set_manual_mode(self) -> dict[str, Any]:
         if not self.running or self.bridge is None or self.acu is None:
             raise RuntimeError("Start the SecureEV runtime before enabling manual mode.")
-        self.bridge.stop_autonomous_patrol()
-        self.acu.disable_autonomous_mode()
-        return self.bridge.get_autonomy_status()
+        with self._carla_operation_lock:
+            self.bridge.stop_autonomous_patrol()
+            self.acu.disable_autonomous_mode()
+            return self.bridge.get_autonomy_status()
 
     def send_control(self, throttle: float, brake: float, steer: float) -> bool:
         if self.publisher is None:
             raise RuntimeError("Runtime publisher is not available.")
+        if self._safe_stop_latched and not (brake >= 1.0 and throttle == 0.0):
+            raise RuntimeError("Vehicle is in an emergency safe stop; recover before controlling it.")
         # Any user-authored VCU command explicitly switches the session to
         # manual mode so the Traffic Manager cannot fight the requested input.
         if self.acu is not None and self.acu.vehicle_state.autonomous_mode:
@@ -773,18 +849,74 @@ class SecureEVRuntime:
         )
         return self.publisher.publish("secureev/vcu/control", message, qos=1)
 
-    def _enter_safe_stop(self) -> None:
-        """Disable autonomy and physically stop the simulated EV."""
-        if self.bridge is not None and self.bridge.vehicle is not None:
-            try:
-                self.bridge.emergency_stop()
-            except Exception as exc:
-                self._emit({"type": "runtime_error", "stage": "safe_stop", "error": str(exc), "timestamp": time.time()})
+    def _request_safe_stop(self) -> bool:
+        """Latch a stop request for execution by the runtime/CARLA thread."""
+        self._safe_stop_latched = True
         if self.acu is not None:
             try:
                 self.acu.disable_autonomous_mode()
             except Exception:
                 pass
+        return True
+
+    def _enter_safe_stop(self) -> None:
+        self._request_safe_stop()
+
+    def _allow_pending_command(self, message: dict[str, Any]) -> bool:
+        if not self._safe_stop_latched:
+            return True
+        command = str((message.get("data") or {}).get("command", "")).strip().lower()
+        return command == "emergency_brake"
+
+    def _run_unauthorized_acceleration(self, now: float) -> None:
+        attack = self._unauthorized_acceleration
+        if attack is None or self.bridge is None:
+            return
+        if self._safe_stop_latched or now >= attack["expires_at"]:
+            if self.bridge.autopilot_enabled and not self._safe_stop_latched:
+                self.bridge.set_patrol_target_speed(self.autonomous_target_speed_kmh)
+            self._unauthorized_acceleration = None
+            return
+        if not self.bridge.autopilot_enabled:
+            self._unauthorized_acceleration = None
+            return
+        self.bridge.set_patrol_target_speed(attack["target_speed_kmh"])
+        attack["applied"] = 1.0
+        with self._attack_condition:
+            self._attack_condition.notify_all()
+
+    def _start_unauthorized_acceleration(self) -> dict[str, float]:
+        if self._unauthorized_acceleration is not None:
+            raise RuntimeError("Unauthorized acceleration attack is already active.")
+        if self._safe_stop_latched:
+            raise RuntimeError("Vehicle is in an emergency safe stop; recover before attacking.")
+        if self.bridge is None or self.bridge.vehicle is None or not self.bridge.autopilot_enabled:
+            raise RuntimeError("Unauthorized acceleration requires active autonomous patrol.")
+        actual_speed = float(self.bridge.get_ground_truth_state()["speed_kmh"])
+        target_speed = min(
+            UNAUTHORIZED_ACCELERATION_MAX_KMH,
+            max(self.autonomous_target_speed_kmh + 5.0, actual_speed + 8.0),
+        )
+        self._unauthorized_acceleration = {
+            "target_speed_kmh": target_speed,
+            "started_at": time.time(),
+            "expires_at": time.monotonic() + UNAUTHORIZED_ACCELERATION_DURATION_SECONDS,
+            "before_speed_kmh": actual_speed,
+            "applied": 0.0,
+        }
+        return dict(self._unauthorized_acceleration)
+
+    def _wait_for_acceleration_effect(self, timeout: float = 0.75) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._attack_condition:
+            while self._unauthorized_acceleration is not None:
+                if self._unauthorized_acceleration.get("applied") == 1.0:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._attack_condition.wait(remaining)
+        return False
 
     def launch_attack(self, name: str) -> dict[str, Any]:
         if not self.running or self.publisher is None:
@@ -798,12 +930,24 @@ class SecureEVRuntime:
             scenario = self.data_attacker.gps_spoofing(sequence=1)
         elif name == "speed_spoofing":
             assert self.data_attacker is not None
-            scenario = self.data_attacker.speed_spoofing(sequence=1)
+            ground_truth = self.get_ground_truth()
+            actual_speed = float((ground_truth or {}).get("speed_kmh", 0.0))
+            spoofed_speed = max(actual_speed + 20.0, 25.0)
+            self._speed_spoof_value = spoofed_speed
+            self._speed_spoof_until = time.monotonic() + 3.0
+            scenario = self.data_attacker.speed_spoofing(
+                sequence=1,
+                spoofed_speed_kmh=spoofed_speed,
+            )
         elif name == "battery_soc_spoofing":
             assert self.data_attacker is not None
             scenario = self.data_attacker.battery_soc_spoofing(sequence=1)
         elif name == "unauthorized_acceleration":
             assert self.control_attacker is not None
+            acceleration = self._start_unauthorized_acceleration()
+            if not self._wait_for_acceleration_effect():
+                self._unauthorized_acceleration = None
+                raise RuntimeError("Unable to activate the bounded Traffic Manager attack effect.")
             scenario = self.control_attacker.unauthorized_acceleration(sequence=sequence)
         elif name == "out_of_range_control":
             assert self.control_attacker is not None
@@ -899,7 +1043,7 @@ class SecureEVRuntime:
             name,
             str(scenario.message.get("message_id", "")),
         ) if published else None
-        return {
+        result = {
             "name": scenario.name,
             "topic": scenario.topic,
             "ecu": getattr(scenario, "ecu", "VCU"),
@@ -911,6 +1055,32 @@ class SecureEVRuntime:
             "defense_reason": outcome.get("reason") if outcome else None,
             "timestamp": time.time(),
         }
+        if name == "unauthorized_acceleration":
+            ground_truth = self.get_ground_truth()
+            result.update(
+                {
+                    "requested_target_speed_kmh": acceleration["target_speed_kmh"],
+                    "actual_speed_before_kmh": acceleration["before_speed_kmh"],
+                    "actual_speed_after_kmh": (
+                        ground_truth["speed_kmh"] if ground_truth else None
+                    ),
+                    "attack_effect": "traffic_manager_target_speed",
+                    "effect_duration_seconds": UNAUTHORIZED_ACCELERATION_DURATION_SECONDS,
+                    "mitigation": "controlled_emergency_brake",
+                }
+            )
+        if name == "speed_spoofing":
+            ground_truth = self.get_ground_truth()
+            result.update(
+                {
+                    "reported_speed_kmh": scenario.expected_value,
+                    "trusted_speed_kmh": ground_truth["speed_kmh"]
+                    if ground_truth
+                    else None,
+                    "attack_effect": "reported_telemetry_only",
+                }
+            )
+        return result
 
     def _await_attack_outcome(
         self,
